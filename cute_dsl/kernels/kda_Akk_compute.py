@@ -8,13 +8,145 @@ Tile size: 16x64 (BC x BK), double buffer
 """
 
 import torch
+import triton
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm
 import cuda.bindings.driver as cuda
 import json
 import os
+import sys
+
+# Add path for Triton reference kernel
+sys.path.insert(0, "/home/menyu/workspace/hongli/origin_space/flash-linear-attention")
+from fla.ops.kda.chunk_intra import chunk_kda_fwd_kernel_intra_sub_chunk, IS_GATHER_SUPPORTED
+
+
+# ===========================================================================
+# TF32 MMA Inline PTX (m16n8k8)
+# ===========================================================================
+@dsl_user_op
+def mma_tf32_m16n8k8(
+    a0, a1, a2, a3,      # A: 4 TF32 registers
+    b0, b1,              # B: 2 TF32 registers
+    c0, c1, c2, c3,      # C accumulator: 4 FP32 registers
+    *, loc=None, ip=None
+):
+    """TF32 MMA: D = A * B + C, shape m16n8k8"""
+    a0_bits = llvm.bitcast(T.i32(), a0.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    a1_bits = llvm.bitcast(T.i32(), a1.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    a2_bits = llvm.bitcast(T.i32(), a2.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    a3_bits = llvm.bitcast(T.i32(), a3.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    b0_bits = llvm.bitcast(T.i32(), b0.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    b1_bits = llvm.bitcast(T.i32(), b1.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    
+    result = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(f32, f32, f32, f32)>"),
+        [a0_bits, a1_bits, a2_bits, a3_bits, b0_bits, b1_bits,
+         c0.ir_value(loc=loc, ip=ip), c1.ir_value(loc=loc, ip=ip),
+         c2.ir_value(loc=loc, ip=ip), c3.ir_value(loc=loc, ip=ip)],
+        """{
+            mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32
+                {$0, $1, $2, $3},
+                {$4, $5, $6, $7},
+                {$8, $9},
+                {$10, $11, $12, $13};
+        }""",
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    
+    d0 = cutlass.Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip))
+    d1 = cutlass.Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip))
+    d2 = cutlass.Float32(llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip))
+    d3 = cutlass.Float32(llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip))
+    return d0, d1, d2, d3
+
+
+# ===========================================================================
+# Manual load/store for TF32 MMA (from mma_tf32_16x16.py)
+# ===========================================================================
+@dsl_user_op
+def load_A_tf32(
+    sA: cute.Tensor,  # (16, 8) FP32 in SMEM, row-major
+    lane_id,
+    *, loc=None, ip=None
+):
+    """
+    Load A matrix (16x8) from SMEM to registers for TF32 MMA.
+    
+    Register layout (from PTX ISA):
+    - group_id = lane_id / 4 (0-7)
+    - tid_in_group = lane_id % 4 (0-3)
+    - a0 = A[group_id,     tid_in_group]
+    - a1 = A[group_id + 8, tid_in_group]
+    - a2 = A[group_id,     tid_in_group + 4]
+    - a3 = A[group_id + 8, tid_in_group + 4]
+    """
+    group_id = lane_id // 4
+    tid_in_group = lane_id % 4
+    
+    a0 = cutlass.Float32(sA[group_id, tid_in_group])
+    a1 = cutlass.Float32(sA[group_id + 8, tid_in_group])
+    a2 = cutlass.Float32(sA[group_id, tid_in_group + 4])
+    a3 = cutlass.Float32(sA[group_id + 8, tid_in_group + 4])
+    
+    return a0, a1, a2, a3
+
+
+@dsl_user_op
+def load_B_tf32_from_rowmajor(
+    sB: cute.Tensor,  # (8, 8) FP32 in SMEM, row-major
+    lane_id,
+    *, loc=None, ip=None
+):
+    """
+    Load B matrix (8x8) from row-major SMEM to registers for TF32 MMA.
+    MMA expects B in col-major, so we load transposed.
+    
+    For B in row-major: B[row, col]
+    MMA wants col-major view, so we read with swapped indices.
+    """
+    group_id = lane_id // 4
+    tid_in_group = lane_id % 4
+    
+    # Load with transposed indices (swap row/col)
+    b0 = cutlass.Float32(sB[tid_in_group, group_id])
+    b1 = cutlass.Float32(sB[tid_in_group + 4, group_id])
+    
+    return b0, b1
+
+
+@dsl_user_op
+def store_C_tf32(
+    sC: cute.Tensor,  # (16, 8) FP32 in SMEM, row-major
+    c0, c1, c2, c3,   # 4 FP32 registers
+    lane_id,
+    *, loc=None, ip=None
+):
+    """
+    Store C/D matrix (16x8) from registers to SMEM.
+    
+    Register layout:
+    - group_id = lane_id / 4 (0-7)
+    - tid_in_group = lane_id % 4 (0-3)
+    - c0 -> C[group_id, tid_in_group * 2]
+    - c1 -> C[group_id, tid_in_group * 2 + 1]
+    - c2 -> C[group_id + 8, tid_in_group * 2]
+    - c3 -> C[group_id + 8, tid_in_group * 2 + 1]
+    """
+    group_id = lane_id // 4
+    tid_in_group = lane_id % 4
+    
+    sC[group_id, tid_in_group * 2] = c0
+    sC[group_id, tid_in_group * 2 + 1] = c1
+    sC[group_id + 8, tid_in_group * 2] = c2
+    sC[group_id + 8, tid_in_group * 2 + 1] = c3
 
 
 # 全局配置
@@ -37,11 +169,13 @@ def kda_Akk_kernel(
     Aqk_tensor: cute.Tensor,     # (B, T, H, BT) output (debug: write back loaded q[:, :BC] as fp16 into [:BC])
     g_smem_layout: cute.Layout,  # (BC, BK, NUM_STAGES)
     qk_smem_layout: cute.Layout, # (BC, BK, NUM_STAGES * 2) for q and k
-    accum_smem_layout: cute.Layout, # (BC, BC * NUM_WARPS)
+    qk_smem_layout_f32: cute.Layout, # (BC, BK, NUM_STAGES) float32 view for r_qgq
+    accum_smem_layout: cute.Layout, # (BC, BC * NUM_WARPS, 2) for Aqk and Akk
     beta_smem_layout: cute.Layout, # (BT,)
     BT: cutlass.Constexpr[int],
     num_k_tiles: cutlass.Constexpr[int],
-    T: int,
+    seq_len: int,                # sequence length (renamed from T to avoid shadowing cutlass.T)
+    scale: cutlass.Float32,      # scale factor for Aqk
 ):
     """
     Debug kernel:
@@ -61,7 +195,20 @@ def kda_Akk_kernel(
     # Allocate shared memory
     smem = cutlass.utils.SmemAllocator()
     sG = smem.allocate_tensor(cutlass.Float32, g_smem_layout, 128)
-    sQK = smem.allocate_tensor(cutlass.Float16, qk_smem_layout, 128)
+    
+    # Allocate q/k smem with dual view (fp16 for loading, fp32 for storing r_qgq)
+    # q+k: (BC, BK, NUM_STAGES * 2) fp16 = (16, 64, 4) * 2 bytes = 8KB
+    # Reused as: (BC, BK, NUM_STAGES) fp32 = (16, 64, 2) * 4 bytes = 8KB
+    QK_SMEM_BYTES = BC * BK * NUM_STAGES * 2 * 2  # 8KB
+    ptr_sQK_raw = smem.allocate(QK_SMEM_BYTES, 128)
+    
+    # fp16 view (for loading q/k from global memory)
+    ptr_sQK_fp16 = cute.recast_ptr(ptr_sQK_raw, dtype=cutlass.Float16)
+    sQK = cute.make_tensor(ptr_sQK_fp16, qk_smem_layout)
+    
+    # fp32 view (for storing r_qgq, reusing q+k space)
+    ptr_sQK_f32 = cute.recast_ptr(ptr_sQK_raw, dtype=cutlass.Float32)
+    sQK_f32 = cute.make_tensor(ptr_sQK_f32, qk_smem_layout_f32)
 
     sAccum = smem.allocate_tensor(cutlass.Float32, accum_smem_layout, 128)
     sBeta = smem.allocate_tensor(cutlass.Float16, beta_smem_layout, 128)
@@ -178,8 +325,8 @@ def kda_Akk_kernel(
         k_tile = it - t_sub * num_k_tiles
         t_abs_base = t_start + t_sub * BC
 
-        # gn_row = min(BC//2, max(0, T - t_abs_base - 1))
-        gn_row = cutlass.min(BC // 2, cutlass.max(0, T - t_abs_base - 1))
+        # gn_row = min(BC//2, max(0, seq_len - t_abs_base - 1))
+        gn_row = cutlass.min(BC // 2, cutlass.max(0, seq_len - t_abs_base - 1))
 
         # Thread mapping
         warp_id = tidx // 32
@@ -208,10 +355,10 @@ def kda_Akk_kernel(
         gn_val_0 = sG[(gn_row, col_base, stage)]
         gn_val_1 = sG[(gn_row, col_base + 1, stage)]
 
-        # Compute all fused element-wise products in one pass
+        # 2. compute all fused element-wise products in one pass
         for ri in range(4):
             r = row_base + ri
-            if t_abs_base + r < T:
+            if t_abs_base + r < seq_len:
                 g_val_0 = sG[(r, col_base, stage)]
                 g_val_1 = sG[(r, col_base + 1, stage)]
                 # Load q values from sQK (interleaved: stage*2)
@@ -237,33 +384,233 @@ def kda_Akk_kernel(
                 # Fused: k * gk (B matrix, will be transposed in GEMM)
                 r_kgk[(ri, 0)] = k_val_0 * gk_0
                 r_kgk[(ri, 1)] = k_val_1 * gk_1
+            else:
+                # Out of bounds: set to 0 (same as Triton's tl.where(m_c, ..., 0.))
+                r_qgq[(ri, 0)] = cutlass.Float32(0.0)
+                r_qgq[(ri, 1)] = cutlass.Float32(0.0)
+                r_kgq[(ri, 0)] = cutlass.Float32(0.0)
+                r_kgq[(ri, 1)] = cutlass.Float32(0.0)
+                r_kgk[(ri, 0)] = cutlass.Float32(0.0)
+                r_kgk[(ri, 1)] = cutlass.Float32(0.0)
         
-        # Barrier to ensure all threads finished reading q/k from sQK before overwriting
+        # 3. barrier to ensure all threads finished reading q/k from sQK before overwriting
         cute.arch.barrier()
         
-        # =============== Write r_kgk to SMEM (reuse sG's current stage) ===============
+        # 4. write r_kgk and r_qgq to SMEM
+        # r_kgk -> sG (reuse g's current stage)
+        # r_qgq -> sQK_f32 (reuse q+k position as float32)
         for ri in range(4):
             r = row_base + ri
             sG[(r, col_base, stage)] = r_kgk[(ri, 0)]
             sG[(r, col_base + 1, stage)] = r_kgk[(ri, 1)]
-        
-        
+            sQK_f32[(r, col_base, stage)] = r_qgq[(ri, 0)]
+            sQK_f32[(r, col_base + 1, stage)] = r_qgq[(ri, 1)]
         
         cute.arch.barrier()
-
-        # =============== Debug writeback (current stage) ===============
+        
+        # 5. MMA: Compute both Aqk and Akk
+        #   Aqk = r_qgq @ r_kgk^T  -> sAccum[:, :, 0]
+        #   Akk = r_kgq @ r_kgk^T  -> sAccum[:, :, 1]
+        # 
+        # Data in SMEM:
+        #   A matrix (r_qgq): sQK_f32[:, :, stage] - 16x64 fp32
+        #   B matrix (r_kgk): sG[:, :, stage] - 16x64 fp32
+        #   A matrix (r_kgq): still in registers, need to write to sQK_f32 after Aqk MMA
+        #
+        # Strategy: Sequential MMA
+        #   1. First compute Aqk using r_qgq (already in sQK_f32)
+        #   2. Then write r_kgq to sQK_f32 and compute Akk
+        #   B matrix (r_kgk) is shared for both MMAs
+        
         t_sub = it // num_k_tiles
         k_tile = it - t_sub * num_k_tiles
-        t_abs_base = t_start + t_sub * BC
-        # Only write "prefix columns" on K dimension -> only k_tile==0 and c in [0, BC)
-        if k_tile == 0:
-            # Write Akk/Aqk: [BC rows, BC cols]
+        
+        lane_id_mma = tidx % 32
+        k_start = warp_id * 2  # warp 0 -> k=0,1; warp 1 -> k=2,3; etc.
+        group_id = lane_id_mma // 4
+        tid_in_group = lane_id_mma % 4
+        warp_col_base = warp_id * BC  # warp_id * 16
+        
+        # ========== Aqk MMA (A = r_qgq, already in sQK_f32) ==========
+        # Initialize accumulators first (CuTe DSL requires init before control flow)
+        aqk_c00_0 = cutlass.Float32(0.0)
+        aqk_c00_1 = cutlass.Float32(0.0)
+        aqk_c00_2 = cutlass.Float32(0.0)
+        aqk_c00_3 = cutlass.Float32(0.0)
+        aqk_c01_0 = cutlass.Float32(0.0)
+        aqk_c01_1 = cutlass.Float32(0.0)
+        aqk_c01_2 = cutlass.Float32(0.0)
+        aqk_c01_3 = cutlass.Float32(0.0)
+        
+        # k_tile > 0: Load previous partial sums from sAccum[:, :, 0]
+        if k_tile != 0:
+            aqk_c00_0 = sAccum[(group_id, warp_col_base + tid_in_group * 2, 0)]
+            aqk_c00_1 = sAccum[(group_id, warp_col_base + tid_in_group * 2 + 1, 0)]
+            aqk_c00_2 = sAccum[(group_id + 8, warp_col_base + tid_in_group * 2, 0)]
+            aqk_c00_3 = sAccum[(group_id + 8, warp_col_base + tid_in_group * 2 + 1, 0)]
+            aqk_c01_0 = sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2, 0)]
+            aqk_c01_1 = sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2 + 1, 0)]
+            aqk_c01_2 = sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2, 0)]
+            aqk_c01_3 = sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2 + 1, 0)]
+        
+        # Aqk MMA loop
+        for k_iter in cutlass.range_constexpr(2):
+            k = k_start + k_iter
+            
+            # Load A tile from sQK_f32 (r_qgq)
+            sA_tile = cute.local_tile(sQK_f32[(None, None, stage)], tiler=(16, 8), coord=(0, k))
+            a0, a1, a2, a3 = load_A_tf32(sA_tile, lane_id_mma)
+            
+            # Load B tiles from sG (r_kgk) - shared for both Aqk and Akk
+            sB_tile_0 = cute.local_tile(sG[(None, None, stage)], tiler=(8, 8), coord=(0, k))
+            b0_0, b1_0 = load_B_tf32_from_rowmajor(sB_tile_0, lane_id_mma)
+            
+            aqk_c00_0, aqk_c00_1, aqk_c00_2, aqk_c00_3 = mma_tf32_m16n8k8(a0, a1, a2, a3, b0_0, b1_0, aqk_c00_0, aqk_c00_1, aqk_c00_2, aqk_c00_3)
+            
+            sB_tile_1 = cute.local_tile(sG[(None, None, stage)], tiler=(8, 8), coord=(1, k))
+            b0_1, b1_1 = load_B_tf32_from_rowmajor(sB_tile_1, lane_id_mma)
+            
+            aqk_c01_0, aqk_c01_1, aqk_c01_2, aqk_c01_3 = mma_tf32_m16n8k8(a0, a1, a2, a3, b0_1, b1_1, aqk_c01_0, aqk_c01_1, aqk_c01_2, aqk_c01_3)
+        
+        # Store Aqk partial result to sAccum[:, :, 0]
+        sAccum[(group_id, warp_col_base + tid_in_group * 2, 0)] = aqk_c00_0
+        sAccum[(group_id, warp_col_base + tid_in_group * 2 + 1, 0)] = aqk_c00_1
+        sAccum[(group_id + 8, warp_col_base + tid_in_group * 2, 0)] = aqk_c00_2
+        sAccum[(group_id + 8, warp_col_base + tid_in_group * 2 + 1, 0)] = aqk_c00_3
+        sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2, 0)] = aqk_c01_0
+        sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_1
+        sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2, 0)] = aqk_c01_2
+        sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_3
+        
+        # ========== Write r_kgq to sQK_f32 (overwrite r_qgq) ==========
+        cute.arch.barrier()
+        for ri in range(4):
+            r = row_base + ri
+            sQK_f32[(r, col_base, stage)] = r_kgq[(ri, 0)]
+            sQK_f32[(r, col_base + 1, stage)] = r_kgq[(ri, 1)]
+        cute.arch.barrier()
+        
+        # ========== Akk MMA (A = r_kgq, now in sQK_f32) ==========
+        # Initialize accumulators first (CuTe DSL requires init before control flow)
+        akk_c00_0 = cutlass.Float32(0.0)
+        akk_c00_1 = cutlass.Float32(0.0)
+        akk_c00_2 = cutlass.Float32(0.0)
+        akk_c00_3 = cutlass.Float32(0.0)
+        akk_c01_0 = cutlass.Float32(0.0)
+        akk_c01_1 = cutlass.Float32(0.0)
+        akk_c01_2 = cutlass.Float32(0.0)
+        akk_c01_3 = cutlass.Float32(0.0)
+        
+        # k_tile > 0: Load previous partial sums from sAccum[:, :, 1]
+        if k_tile != 0:
+            akk_c00_0 = sAccum[(group_id, warp_col_base + tid_in_group * 2, 1)]
+            akk_c00_1 = sAccum[(group_id, warp_col_base + tid_in_group * 2 + 1, 1)]
+            akk_c00_2 = sAccum[(group_id + 8, warp_col_base + tid_in_group * 2, 1)]
+            akk_c00_3 = sAccum[(group_id + 8, warp_col_base + tid_in_group * 2 + 1, 1)]
+            akk_c01_0 = sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2, 1)]
+            akk_c01_1 = sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2 + 1, 1)]
+            akk_c01_2 = sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2, 1)]
+            akk_c01_3 = sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2 + 1, 1)]
+        
+        # Akk MMA loop
+        for k_iter in cutlass.range_constexpr(2):
+            k = k_start + k_iter
+            
+            # Load A tile from sQK_f32 (r_kgq)
+            sA_tile = cute.local_tile(sQK_f32[(None, None, stage)], tiler=(16, 8), coord=(0, k))
+            a0, a1, a2, a3 = load_A_tf32(sA_tile, lane_id_mma)
+            
+            # Load B tiles from sG (r_kgk) - same as before
+            sB_tile_0 = cute.local_tile(sG[(None, None, stage)], tiler=(8, 8), coord=(0, k))
+            b0_0, b1_0 = load_B_tf32_from_rowmajor(sB_tile_0, lane_id_mma)
+            
+            akk_c00_0, akk_c00_1, akk_c00_2, akk_c00_3 = mma_tf32_m16n8k8(a0, a1, a2, a3, b0_0, b1_0, akk_c00_0, akk_c00_1, akk_c00_2, akk_c00_3)
+            
+            sB_tile_1 = cute.local_tile(sG[(None, None, stage)], tiler=(8, 8), coord=(1, k))
+            b0_1, b1_1 = load_B_tf32_from_rowmajor(sB_tile_1, lane_id_mma)
+            
+            akk_c01_0, akk_c01_1, akk_c01_2, akk_c01_3 = mma_tf32_m16n8k8(a0, a1, a2, a3, b0_1, b1_1, akk_c01_0, akk_c01_1, akk_c01_2, akk_c01_3)
+        
+        # Store Akk partial result to sAccum[:, :, 1]
+        sAccum[(group_id, warp_col_base + tid_in_group * 2, 1)] = akk_c00_0
+        sAccum[(group_id, warp_col_base + tid_in_group * 2 + 1, 1)] = akk_c00_1
+        sAccum[(group_id + 8, warp_col_base + tid_in_group * 2, 1)] = akk_c00_2
+        sAccum[(group_id + 8, warp_col_base + tid_in_group * 2 + 1, 1)] = akk_c00_3
+        sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2, 1)] = akk_c01_0
+        sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2 + 1, 1)] = akk_c01_1
+        sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2, 1)] = akk_c01_2
+        sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2 + 1, 1)] = akk_c01_3
+        
+        cute.arch.barrier()
+        
+        # 6. Reduction: only after processing all k_tiles for this t_sub
+        if k_tile == num_k_tiles - 1:
+            # Sum all 4 warps' partial results for both Aqk and Akk
+            # 128 threads, 16x16=256 elements, so 2 elements per thread
+            elem_idx = tidx * 2
+            if elem_idx < BC * BC:
+                row0 = elem_idx // BC
+                col0 = elem_idx % BC
+                row1 = (elem_idx + 1) // BC
+                col1 = (elem_idx + 1) % BC
+                
+                # Aqk reduction with scale, apply mask (row >= col)
+                sum_aqk_0 = sAccum[(row0, col0, 0)] + sAccum[(row0, col0 + 16, 0)] + sAccum[(row0, col0 + 32, 0)] + sAccum[(row0, col0 + 48, 0)]
+                sum_aqk_1 = sAccum[(row1, col1, 0)] + sAccum[(row1, col1 + 16, 0)] + sAccum[(row1, col1 + 32, 0)] + sAccum[(row1, col1 + 48, 0)]
+                # mask: row >= col (lower triangular with diagonal), else 0
+                if row0 >= col0:
+                    sAccum[(row0, col0, 0)] = sum_aqk_0 * scale
+                else:
+                    sAccum[(row0, col0, 0)] = cutlass.Float32(0.0)
+                if row1 >= col1:
+                    sAccum[(row1, col1, 0)] = sum_aqk_1 * scale
+                else:
+                    sAccum[(row1, col1, 0)] = cutlass.Float32(0.0)
+                
+                # Akk reduction with beta, apply mask (row > col)
+                # beta index: t_sub * BC + row (within BT range)
+                beta_idx_0 = t_sub * BC + row0
+                beta_idx_1 = t_sub * BC + row1
+                beta_0 = cutlass.Float32(sBeta[(beta_idx_0,)])
+                beta_1 = cutlass.Float32(sBeta[(beta_idx_1,)])
+                
+                sum_akk_0 = sAccum[(row0, col0, 1)] + sAccum[(row0, col0 + 16, 1)] + sAccum[(row0, col0 + 32, 1)] + sAccum[(row0, col0 + 48, 1)]
+                sum_akk_1 = sAccum[(row1, col1, 1)] + sAccum[(row1, col1 + 16, 1)] + sAccum[(row1, col1 + 32, 1)] + sAccum[(row1, col1 + 48, 1)]
+                # mask: row > col (strictly lower triangular), else 0
+                if row0 > col0:
+                    sAccum[(row0, col0, 1)] = sum_akk_0 * beta_0
+                else:
+                    sAccum[(row0, col0, 1)] = cutlass.Float32(0.0)
+                if row1 > col1:
+                    sAccum[(row1, col1, 1)] = sum_akk_1 * beta_1
+                else:
+                    sAccum[(row1, col1, 1)] = cutlass.Float32(0.0)
+            
+            cute.arch.barrier()
+            
+            # 7. Apply mask and write back to global memory
+            # Aqk: mask m_Aqk = (row >= col), i.e., lower triangular including diagonal
+            # Akk: mask m_Akk = (row > col), i.e., strictly lower triangular
+            #
+            # Output layout:
+            #   Aqk_tensor: (B, T, H, BT) -> write to [i_b, t_abs_base + row, i_h, t_sub * BC + col]
+            #   Akk_tensor: (B, T, H, BC) -> write to [i_b, t_abs_base + row, i_h, col]
+            t_abs_base = t_start + t_sub * BC
+            
+            # 128 threads, 256 elements, 2 elements per thread
             linear = tidx
             while linear < (BC * BC):
-                r = linear // BC
-                c = linear - r * BC
-                Akk_tensor[(i_b, t_abs_base + r, i_h, c)] = sG[(r, c, stage)]
-                Aqk_tensor[(i_b, t_abs_base + r, i_h, c)] = sQK[(r, c, stage * 2)]
+                row = linear // BC
+                col = linear % BC
+                
+                # Read from reduced sAccum[:, 0:16, :] (scale/beta and mask already applied)
+                val_aqk = sAccum[(row, col, 0)]  # fp32, masked with 0 for upper triangle
+                val_akk = sAccum[(row, col, 1)]  # fp32, masked with 0 for upper triangle + diagonal
+                
+                # Direct write back (mask already applied in reduction)
+                Aqk_tensor[(i_b, t_abs_base + row, i_h, t_sub * BC + col)] = cutlass.Float16(val_aqk)
+                Akk_tensor[(i_b, t_abs_base + row, i_h, col)] = val_akk
+                
                 linear = linear + NUM_THREADS
 
         cute.arch.barrier()
@@ -277,14 +624,15 @@ def run_kda_Akk(
     beta_tensor: cute.Tensor,
     Akk_tensor: cute.Tensor,
     Aqk_tensor: cute.Tensor,
+    scale: float,
     stream: cuda.CUstream
 ):
-    B, T, H, K = g_tensor.layout.shape
+    B, seq_len, H, K = g_tensor.layout.shape
     BT = 64  # chunk size
     
     # Number of tiles in K dimension
     num_k_tiles = cute.ceil_div(K, BK)
-    NT = cute.ceil_div(T, BT)  # number of chunks
+    NT = cute.ceil_div(seq_len, BT)  # number of chunks
     
     # =============== Create tiled copy for g (float32) ===============
     # 128 bits = 4 floats per copy
@@ -333,10 +681,18 @@ def run_kda_Akk(
         (BC, BK, NUM_STAGES * 2),
         stride=(BK, 1, BC * BK)
     )
-
+    
+    # Float32 view for reusing q+k smem space (for r_qgq)
+    # Each fp32 stage spans 2 fp16 stages (q+k), so stride on 3rd dim is doubled
+    qk_smem_layout_f32 = cute.make_layout(
+        (BC, BK, NUM_STAGES),
+        stride=(BK, 1, BC * BK * 2)
+    )
+    
+    # accum: (BC, BC * NUM_WARPS, 2) for Aqk (slot 0) and Akk (slot 1)
     accum_smem_layout = cute.make_layout(
-        (BC, BC * NUM_WARPS),
-        stride=(BC * NUM_WARPS, 1)
+        (BC, BC * NUM_WARPS, 2),
+        stride=(BC * NUM_WARPS * 2, 2, 1)
     )
 
     # beta: (BT,) fp16
@@ -348,11 +704,15 @@ def run_kda_Akk(
     # SMEM size calculation
     # g: 16 * 64 * 2 * 4 bytes = 8192 bytes
     # qk: 16 * 64 * 4 * 2 bytes = 8192 bytes
-    # accum: 16 * 16 * 4 * 4 warps = 4096 bytes
+    # accum: 16 * 64 * 2 * 4 bytes = 8192 bytes (Aqk + Akk)
     # beta: BT * 2 bytes
-    smem_bytes = 4 * BC * BK * NUM_STAGES + 2 * BC * BK * NUM_STAGES * 2 + 2 * BT + 128 + 4 * BC * BC * NUM_WARPS
+    smem_bytes = (4 * BC * BK * NUM_STAGES +       # sG
+                  2 * BC * BK * NUM_STAGES * 2 +   # sQK
+                  4 * BC * BC * NUM_WARPS * 2 +    # sAccum (2 slots: Aqk, Akk)
+                  2 * BT +                          # sBeta
+                  128)                              # alignment
     
-    print(f"KDA Akk: B={B}, T={T}, H={H}, K={K}")
+    print(f"KDA Akk: B={B}, T={seq_len}, H={H}, K={K}")
     print(f"  Tiles: NT={NT}, num_k_tiles={num_k_tiles}")
     print(f"  SMEM: {smem_bytes} bytes\n")
     
@@ -367,11 +727,13 @@ def run_kda_Akk(
         Aqk_tensor,
         g_smem_layout,
         qk_smem_layout,
+        qk_smem_layout_f32,
         accum_smem_layout,
         beta_smem_layout,
         BT,
         num_k_tiles,
-        T,
+        seq_len,
+        scale,
     ).launch(
         grid=(B, NT, H),
         block=[NUM_THREADS, 1, 1],
@@ -386,23 +748,23 @@ if __name__ == "__main__":
     
     # Test parameters
     # NOTE: For debug writeback, Akk/Aqk are (B, T, H, BC) float32, keep sizes small.
-    B, T, H, K = 1, 8192, 96, 128  # batch, seq_len, heads, head_dim
+    B, seq_len, H, K = 1, 8192, 96, 128  # batch, seq_len, heads, head_dim
     BT = 64  # chunk size
     warmup_iters = 5
     test_iters = 100
     use_profiler = True
     
     # Create test tensors
-    g = torch.randn(B, T, H, K, dtype=torch.float32, device='cuda')
-    q = torch.randn(B, T, H, K, dtype=torch.float16, device='cuda')
-    k = torch.randn(B, T, H, K, dtype=torch.float16, device='cuda')
-    beta = torch.randn(B, T, H, dtype=torch.float16, device='cuda')
+    g = torch.randn(B, seq_len, H, K, dtype=torch.float32, device='cuda')
+    q = torch.randn(B, seq_len, H, K, dtype=torch.float16, device='cuda')
+    k = torch.randn(B, seq_len, H, K, dtype=torch.float16, device='cuda')
+    beta = torch.randn(B, seq_len, H, dtype=torch.float16, device='cuda')
     
     # Output tensors (debug writeback buffers)
-    # - Akk: (B, T, H, BC) fp32   <- g[..., :BC]
-    # - Aqk: (B, T, H, BT) fp16   <- q[..., :BC] written into Aqk[..., :BC]
-    Akk = torch.empty(B, T, H, BC, dtype=torch.float32, device='cuda')
-    Aqk = torch.empty(B, T, H, BT, dtype=torch.float16, device='cuda')
+    # - Akk: (B, seq_len, H, BC) fp32
+    # - Aqk: (B, seq_len, H, BT) fp16
+    Akk = torch.empty(B, seq_len, H, BC, dtype=torch.float32, device='cuda')
+    Aqk = torch.empty(B, seq_len, H, BT, dtype=torch.float16, device='cuda')
     
     # Create cute tensors
     g_tensor = from_dlpack(g, assumed_align=16)
@@ -425,38 +787,98 @@ if __name__ == "__main__":
     
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     
+    # scale = 1 / sqrt(K)
+    scale = 1.0 / (K ** 0.5)
+    
     print("Compiling kernel...")
-    compiled = cute.compile(run_kda_Akk, g_tensor, q_tensor, k_tensor, beta_tensor, Akk_tensor, Aqk_tensor, stream)
+    compiled = cute.compile(run_kda_Akk, g_tensor, q_tensor, k_tensor, beta_tensor, Akk_tensor, Aqk_tensor, scale, stream)
     
     # Warmup
     print("Warming up...")
     for _ in range(warmup_iters):
-        compiled(g_tensor, q_tensor, k_tensor, beta_tensor, Akk_tensor, Aqk_tensor, stream)
+        compiled(g_tensor, q_tensor, k_tensor, beta_tensor, Akk_tensor, Aqk_tensor, scale, stream)
     torch.cuda.synchronize()
     
     print("\n✓ Kernel executed successfully!")
 
-    # Correctness check (debug writeback)
-    max_diff_g = (Akk - g[..., :BC]).abs().max().item()
-    max_diff_q = (Aqk[..., :BC] - q[..., :BC]).abs().max().item()
-    print(f"\nCorrectness:")
-    print(f"  max|Akk - g| = {max_diff_g:.6e}")
-    print(f"  max|Aqk - q| = {max_diff_q:.6e}")
-    if max_diff_g > 1e-4 or max_diff_q > 1e-2:
-        print("✗ FAIL (writeback mismatch)")
-        raise SystemExit(1)
-    print("✓ PASS (writeback matches g/q)")
-
-    # Print a small slice for manual inspection (b=0, h=0): first 5 rows x first 5 cols
-    print("\nInspect (b=0, h=0) first 5x5:")
-    print("  Akk[0, :5, 0, :5]:")
-    print(Akk[0, :5, 0, :5].detach().cpu())
-    print("  g  [0, :5, 0, :5]:")
-    print(g[0, :5, 0, :5].detach().cpu())
-    print("  Aqk[0, :5, 0, :5]:")
-    print(Aqk[0, :5, 0, :5].detach().cpu())
-    print("  q  [0, :5, 0, :5]:")
-    print(q[0, :5, 0, :5].detach().cpu())
+    # =============== Correctness check against Triton reference ===============
+    print("\n" + "=" * 50)
+    print("Correctness Check (vs Triton reference kernel)")
+    print("=" * 50)
+    
+    # Allocate reference outputs
+    Aqk_ref = torch.empty(B, seq_len, H, BT, device='cuda', dtype=torch.float16)
+    Akk_ref = torch.empty(B, seq_len, H, BC, device='cuda', dtype=torch.float32)
+    
+    # Run Triton reference kernel
+    NT = triton.cdiv(seq_len, BT)
+    NC = triton.cdiv(BT, BC)
+    BK_triton = triton.next_power_of_2(K)
+    
+    grid = (NT, NC, B * H)
+    chunk_kda_fwd_kernel_intra_sub_chunk[grid](
+        q=q,
+        k=k,
+        g=g,
+        beta=beta,
+        Aqk=Aqk_ref,
+        Akk=Akk_ref,
+        scale=scale,
+        cu_seqlens=None,
+        chunk_indices=None,
+        T=seq_len,
+        H=H,
+        K=K,
+        BT=BT,
+        BC=BC,
+        BK=BK_triton,
+        IS_VARLEN=False,
+        USE_GATHER=IS_GATHER_SUPPORTED,
+    )
+    torch.cuda.synchronize()
+    
+    # Compare results
+    # Note: CuTe outputs - Aqk: (B, seq_len, H, BT), Akk: (B, seq_len, H, BC)
+    # Triton outputs   - Aqk_ref: (B, seq_len, H, BT), Akk_ref: (B, seq_len, H, BC)
+    
+    # Aqk comparison (fp16)
+    max_diff_aqk = (Aqk.float() - Aqk_ref.float()).abs().max().item()
+    mean_diff_aqk = (Aqk.float() - Aqk_ref.float()).abs().mean().item()
+    
+    # Akk comparison (fp32)
+    max_diff_akk = (Akk - Akk_ref).abs().max().item()
+    mean_diff_akk = (Akk - Akk_ref).abs().mean().item()
+    
+    print(f"\nAqk (fp16):")
+    print(f"  max |CuTe - Triton| = {max_diff_aqk:.6e}")
+    print(f"  mean|CuTe - Triton| = {mean_diff_aqk:.6e}")
+    
+    print(f"\nAkk (fp32):")
+    print(f"  max |CuTe - Triton| = {max_diff_akk:.6e}")
+    print(f"  mean|CuTe - Triton| = {mean_diff_akk:.6e}")
+    
+    # Print sample for inspection (b=0, h=0, first sub-chunk)
+    print("\n--- Sample: Aqk[0, 0:8, 0, 0:8] ---")
+    print("CuTe:")
+    print(Aqk[0, 0:8, 0, 0:8].detach().cpu())
+    print("Triton:")
+    print(Aqk_ref[0, 0:8, 0, 0:8].detach().cpu())
+    
+    print("\n--- Sample: Akk[0, 0:8, 0, 0:8] ---")
+    print("CuTe:")
+    print(Akk[0, 0:8, 0, 0:8].detach().cpu())
+    print("Triton:")
+    print(Akk_ref[0, 0:8, 0, 0:8].detach().cpu())
+    
+    # Pass/Fail check
+    # TF32 MMA has ~1e-3 relative error, so use relaxed thresholds
+    aqk_threshold = 1e-2  # fp16 output
+    akk_threshold = 1e-3  # fp32 output
+    
+    if max_diff_aqk > aqk_threshold or max_diff_akk > akk_threshold:
+        print(f"\n✗ FAIL: Aqk diff > {aqk_threshold} or Akk diff > {akk_threshold}")
+    else:
+        print(f"\n✓ PASS: Results match within tolerance")
     
     # Benchmark (torch.profiler only)
     print(f"\nBenchmarking: {test_iters} iterations...")
@@ -482,7 +904,7 @@ if __name__ == "__main__":
             _ = dummy_buffer.sum()
             torch.cuda.synchronize()
             with torch.profiler.record_function(f"kda_Akk_iter{i}"):
-                compiled(g_tensor, q_tensor, k_tensor, beta_tensor, Akk_tensor, Aqk_tensor, stream)
+                compiled(g_tensor, q_tensor, k_tensor, beta_tensor, Akk_tensor, Aqk_tensor, scale, stream)
             torch.cuda.synchronize()
 
     trace_dir = "profiler_traces"
@@ -514,29 +936,30 @@ if __name__ == "__main__":
     
     # Data size (bytes moved by this debug kernel)
     # - Read:  g(fp32) + q(fp16) + k(fp16)  -> full K
-    #          beta(fp16)                   -> BT per token (here modeled as full T)
+    #          beta(fp16)                   -> BT per token (here modeled as full seq_len)
     # - Write: Akk(fp32) -> only first BC columns
     #          Aqk(fp16) -> only first BC columns (even though Aqk is allocated with BT columns)
-    read_bytes = B * T * H * K * (4 + 2 + 2) + (B * T * H * 2)
-    write_bytes = (B * T * H * BC * 4) + (B * T * H * BC * 2)
+    read_bytes = B * seq_len * H * K * (4 + 2 + 2) + (B * seq_len * H * 2)
+    write_bytes = (B * seq_len * H * BC * 4) + (B * seq_len * H * BC * 2)
     data_bytes = read_bytes + write_bytes
     data_mb = data_bytes / 1024 / 1024
     # Use decimal GB to match "peak bandwidth = 8192" convention
     data_gib = data_bytes / 1000 / 1000 / 1000
     
     print("\n" + "=" * 50)
-    print(f"✓ Results:")
+    print(f"✓ CuTe Results:")
     print(f"  Data: {data_mb:.2f} MB")
+    cute_mean_ms = None
     if len(profiler_times_us) > 0:
         prof = torch.tensor(profiler_times_us, dtype=torch.float64)
         prof_ms = prof / 1000.0
-        mean_ms = prof_ms.mean().item()
+        cute_mean_ms = prof_ms.mean().item()
         min_ms = prof_ms.min().item()
-        bw_gibs = data_gib / (mean_ms / 1000.0)
-        peak_bw = 8192.0
+        bw_gibs = data_gib / (cute_mean_ms / 1000.0)
+        peak_bw = 4814
         peak_pct = bw_gibs / peak_bw * 100.0
         print(f"  Bytes (read/write/total): {read_bytes} / {write_bytes} / {data_bytes}")
-        print(f"  Profiler Mean: {mean_ms:.4f} ms (kernel_cutlass only)")
+        print(f"  Profiler Mean: {cute_mean_ms:.4f} ms (kernel_cutlass only)")
         print(f"  Profiler Min:  {min_ms:.4f} ms (kernel_cutlass only)")
         print(f"  BW (profiler mean): {bw_gibs:.1f} GB/s")
         print(f"  Peak% (peak={peak_bw:.0f}): {peak_pct:.2f}%")
@@ -545,6 +968,101 @@ if __name__ == "__main__":
     else:
         print("  ✗ No kernel timings parsed; bandwidth unavailable.")
     print("=" * 50)
-    print("PASS")
+    
+    # =============== Triton Benchmark ===============
+    print(f"\n" + "=" * 50)
+    print(f"Triton Benchmark: {test_iters} iterations...")
+    print("=" * 50)
+    
+    # Warmup
+    for _ in range(10):
+        chunk_kda_fwd_kernel_intra_sub_chunk[grid](
+            q=q, k=k, g=g, beta=beta, Aqk=Aqk_ref, Akk=Akk_ref, scale=scale,
+            cu_seqlens=None, chunk_indices=None,
+            T=seq_len, H=H, K=K, BT=BT, BC=BC, BK=BK_triton,
+            IS_VARLEN=False, USE_GATHER=IS_GATHER_SUPPORTED,
+        )
+    torch.cuda.synchronize()
+    
+    # Profile Triton
+    profiler_triton = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        with_stack=False,
+    )
+    
+    with profiler_triton:
+        for i in range(test_iters):
+            _ = dummy_buffer.sum()
+            torch.cuda.synchronize()
+            with torch.profiler.record_function(f"triton_iter{i}"):
+                chunk_kda_fwd_kernel_intra_sub_chunk[grid](
+                    q=q, k=k, g=g, beta=beta, Aqk=Aqk_ref, Akk=Akk_ref, scale=scale,
+                    cu_seqlens=None, chunk_indices=None,
+                    T=seq_len, H=H, K=K, BT=BT, BC=BC, BK=BK_triton,
+                    IS_VARLEN=False, USE_GATHER=IS_GATHER_SUPPORTED,
+                )
+            torch.cuda.synchronize()
+    
+    trace_file_triton = os.path.join(trace_dir, "kda_Akk_triton.json")
+    profiler_triton.export_chrome_trace(trace_file_triton)
+    print(f"  ✓ Triton profiler trace saved to {trace_file_triton}")
+    
+    triton_times_us = []
+    try:
+        with open(trace_file_triton, "r") as f:
+            trace_data = json.load(f)
+        for event in trace_data.get("traceEvents", []):
+            if event.get("cat") != "kernel":
+                continue
+            name = event.get("name", "")
+            dur = event.get("dur", 0)
+            # Extract Triton kernels (usually named chunk_kda_fwd_kernel_intra_sub_chunk or similar)
+            if dur > 0 and "chunk_kda" in name.lower():
+                triton_times_us.append(dur)
+        if triton_times_us:
+            print(f"  ✓ Parsed {len(triton_times_us)} Triton kernel timings from profiler trace")
+        else:
+            print("  ⚠ No Triton kernel timings found in profiler trace")
+    except Exception as e:
+        print(f"  ✗ Failed to parse Triton profiler trace: {e}")
+        triton_times_us = []
+    
+    print("\n" + "=" * 50)
+    print(f"✓ Triton Results:")
+    triton_mean_ms = None
+    if len(triton_times_us) > 0:
+        prof_triton = torch.tensor(triton_times_us, dtype=torch.float64)
+        prof_triton_ms = prof_triton / 1000.0
+        triton_mean_ms = prof_triton_ms.mean().item()
+        triton_min_ms = prof_triton_ms.min().item()
+        triton_bw_gibs = data_gib / (triton_mean_ms / 1000.0)
+        triton_peak_pct = triton_bw_gibs / peak_bw * 100.0
+        print(f"  Profiler Mean: {triton_mean_ms:.4f} ms")
+        print(f"  Profiler Min:  {triton_min_ms:.4f} ms")
+        print(f"  BW (profiler mean): {triton_bw_gibs:.1f} GB/s")
+        print(f"  Peak% (peak={peak_bw:.0f}): {triton_peak_pct:.2f}%")
+    else:
+        print("  ✗ No kernel timings parsed; bandwidth unavailable.")
+    print("=" * 50)
+    
+    # Summary comparison
+    print("\n" + "=" * 50)
+    print("Performance Comparison:")
+    print("=" * 50)
+    if cute_mean_ms and triton_mean_ms:
+        speedup = triton_mean_ms / cute_mean_ms
+        print(f"  CuTe Mean:   {cute_mean_ms:.4f} ms")
+        print(f"  Triton Mean: {triton_mean_ms:.4f} ms")
+        print(f"  Speedup (Triton/CuTe): {speedup:.2f}x")
+        if speedup > 1:
+            print(f"  → CuTe is {speedup:.2f}x FASTER than Triton")
+        else:
+            print(f"  → Triton is {1/speedup:.2f}x FASTER than CuTe")
+    print("=" * 50)
+    print("DONE")
     
     del compiled
