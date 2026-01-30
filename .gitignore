@@ -1,0 +1,48 @@
+# ---- Nsight Compute / Nsight Systems ----
+*.ncu-rep
+*.ncu-rep.*
+*.qdrep
+*.qdrep.*
+*.nsys-rep
+*.nsys-rep.*
+*.nsys-analysis
+*.sqlite
+*.sqlite3
+
+# ---- Profiling / traces (repo-local) ----
+**/profiler_traces/
+**/nsys_traces/
+**/ncu_reports/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.python-version
+
+# ---- Environments ----
+.venv/
+venv/
+env/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- Build artifacts ----
+build/
+dist/
+*.egg-info/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+
