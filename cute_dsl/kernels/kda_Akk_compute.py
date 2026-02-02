@@ -1,11 +1,6 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-
-"""
-KDA Akk/Aqk Kernel - cp.async Pipeline
-Load g (float32), q (fp16), k (fp16) with async copy
-Tile size: 16x64 (BC x BK), double buffer
-"""
+import os
+# 指定 Triton 缓存目录到 scratch 空间（避免 home 目录空间不足）
+os.environ["TRITON_CACHE_DIR"] = "/home/scratch.peiyuanz_gpu/mhl/.triton_cache"
 
 import torch
 import triton
@@ -22,7 +17,7 @@ import os
 import sys
 
 # Add path for Triton reference kernel
-sys.path.insert(0, "/home/menyu/workspace/hongli/origin_space/flash-linear-attention")
+sys.path.insert(0, "/home/scratch.peiyuanz_gpu/mhl/Personal_workspace/flash-linear-attention")
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_kernel_intra_sub_chunk, IS_GATHER_SUPPORTED
 
 
@@ -89,12 +84,12 @@ def load_A_tf32(
     - a3 = A[group_id + 8, tid_in_group + 4]
     """
     group_id = lane_id // 4
-    tid_in_group = lane_id % 4
+    tid_in_group = (lane_id % 4) * 2
     
     a0 = cutlass.Float32(sA[group_id, tid_in_group])
     a1 = cutlass.Float32(sA[group_id + 8, tid_in_group])
-    a2 = cutlass.Float32(sA[group_id, tid_in_group + 4])
-    a3 = cutlass.Float32(sA[group_id + 8, tid_in_group + 4])
+    a2 = cutlass.Float32(sA[group_id, tid_in_group + 1])
+    a3 = cutlass.Float32(sA[group_id + 8, tid_in_group + 1])
     
     return a0, a1, a2, a3
 
@@ -113,11 +108,11 @@ def load_B_tf32_from_rowmajor(
     MMA wants col-major view, so we read with swapped indices.
     """
     group_id = lane_id // 4
-    tid_in_group = lane_id % 4
+    tid_in_group = (lane_id % 4) * 2
     
     # Load with transposed indices (swap row/col)
     b0 = cutlass.Float32(sB[group_id, tid_in_group])
-    b1 = cutlass.Float32(sB[group_id, tid_in_group + 4])
+    b1 = cutlass.Float32(sB[group_id, tid_in_group + 1])
     
     return b0, b1
 
@@ -169,7 +164,7 @@ def kda_Akk_kernel(
     Aqk_tensor: cute.Tensor,     # (B, T, H, BT) output (debug: write back loaded q[:, :BC] as fp16 into [:BC])
     g_smem_layout: cute.Layout,  # (BC, BK, NUM_STAGES)
     qk_smem_layout: cute.Layout, # (BC, BK, NUM_STAGES * 2) for q and k
-    qk_smem_layout_f32: cute.Layout, # (BC, BK, NUM_STAGES) float32 view for r_qgq
+    qk_smem_layout_f32: cute.Layout, # (BC, BK, 2) float32 for r_qgq (slot 0) and r_kgq (slot 1)
     accum_smem_layout: cute.Layout, # (BC, BC * NUM_WARPS, 2) for Aqk and Akk
     beta_smem_layout: cute.Layout, # (BT,)
     BT: cutlass.Constexpr[int],
@@ -271,6 +266,26 @@ def kda_Akk_kernel(
         cute.arch.cp_async_commit_group()
 
     # =============== Main loop ===============
+    # Accumulators defined outside loop - persist across k_tiles within same t_sub
+    # Only need to write to sAccum once at k_tile == num_k_tiles - 1 for reduction
+    aqk_c00_0 = cutlass.Float32(0.0)
+    aqk_c00_1 = cutlass.Float32(0.0)
+    aqk_c00_2 = cutlass.Float32(0.0)
+    aqk_c00_3 = cutlass.Float32(0.0)
+    aqk_c01_0 = cutlass.Float32(0.0)
+    aqk_c01_1 = cutlass.Float32(0.0)
+    aqk_c01_2 = cutlass.Float32(0.0)
+    aqk_c01_3 = cutlass.Float32(0.0)
+    
+    akk_c00_0 = cutlass.Float32(0.0)
+    akk_c00_1 = cutlass.Float32(0.0)
+    akk_c00_2 = cutlass.Float32(0.0)
+    akk_c00_3 = cutlass.Float32(0.0)
+    akk_c01_0 = cutlass.Float32(0.0)
+    akk_c01_1 = cutlass.Float32(0.0)
+    akk_c01_2 = cutlass.Float32(0.0)
+    akk_c01_3 = cutlass.Float32(0.0)
+    
     for it in range(total_tiles):
         stage = it % NUM_STAGES
 
@@ -390,31 +405,33 @@ def kda_Akk_kernel(
         # 3. barrier to ensure all threads finished reading q/k from sQK before overwriting
         cute.arch.barrier()
         
-        # 4. write r_kgk and r_qgq to SMEM
-        # r_kgk -> sG (reuse g's current stage)
-        # r_qgq -> sQK_f32 (reuse q+k position as float32)
+        # 4. write r_kgk, r_qgq, and r_kgq to SMEM
+        # r_kgk -> sG[:, :, stage]
+        # r_qgq -> sQK_f32[:, :, 0]
+        # r_kgq -> sQK_f32[:, :, 1]
+        # This allows fused MMA loop: load B once, compute both Aqk and Akk!
         for ri in range(4):
             r = row_base + ri
             sG[(r, col_base, stage)] = r_kgk[(ri, 0)]
             sG[(r, col_base + 1, stage)] = r_kgk[(ri, 1)]
-            sQK_f32[(r, col_base, stage)] = r_qgq[(ri, 0)]
-            sQK_f32[(r, col_base + 1, stage)] = r_qgq[(ri, 1)]
+            sQK_f32[(r, col_base, 0)] = r_qgq[(ri, 0)]
+            sQK_f32[(r, col_base + 1, 0)] = r_qgq[(ri, 1)]
+            sQK_f32[(r, col_base, 1)] = r_kgq[(ri, 0)]
+            sQK_f32[(r, col_base + 1, 1)] = r_kgq[(ri, 1)]
         
         cute.arch.barrier()
         
-        # 5. MMA: Compute both Aqk and Akk
+        # 5. Fused MMA: Compute both Aqk and Akk in single loop
         #   Aqk = r_qgq @ r_kgk^T  -> sAccum[:, :, 0]
         #   Akk = r_kgq @ r_kgk^T  -> sAccum[:, :, 1]
         # 
         # Data in SMEM:
-        #   A matrix (r_qgq): sQK_f32[:, :, stage] - 16x64 fp32
+        #   A matrix (r_qgq): sQK_f32[:, :, 0] - 16x64 fp32
+        #   A matrix (r_kgq): sQK_f32[:, :, 1] - 16x64 fp32
         #   B matrix (r_kgk): sG[:, :, stage] - 16x64 fp32
-        #   A matrix (r_kgq): still in registers, need to write to sQK_f32 after Aqk MMA
         #
-        # Strategy: Sequential MMA
-        #   1. First compute Aqk using r_qgq (already in sQK_f32)
-        #   2. Then write r_kgq to sQK_f32 and compute Akk
-        #   B matrix (r_kgk) is shared for both MMAs
+        # Strategy: Fused MMA - load B once, compute both Aqk and Akk
+        # This halves the sG memory reads!
         
         
         t_sub = it // num_k_tiles # sub_idx
@@ -426,187 +443,137 @@ def kda_Akk_kernel(
         tid_in_group = lane_id_mma % 4 # tid_in_group
         warp_col_base = warp_id * BC  # warp_id * 16
         
-        # ========== Aqk MMA (A = r_qgq, already in sQK_f32) ==========
-        # Initialize accumulators first (CuTe DSL requires init before control flow)
-        aqk_c00_0 = cutlass.Float32(0.0)
-        aqk_c00_1 = cutlass.Float32(0.0)
-        aqk_c00_2 = cutlass.Float32(0.0)
-        aqk_c00_3 = cutlass.Float32(0.0)
-        aqk_c01_0 = cutlass.Float32(0.0)
-        aqk_c01_1 = cutlass.Float32(0.0)
-        aqk_c01_2 = cutlass.Float32(0.0)
-        aqk_c01_3 = cutlass.Float32(0.0)
-        
-        # k_tile > 0: Load previous partial sums from sAccum[:, :, 0]
-        if k_tile != 0:
-            aqk_c00_0 = sAccum[(group_id, warp_col_base + tid_in_group * 2, 0)]
-            aqk_c00_1 = sAccum[(group_id, warp_col_base + tid_in_group * 2 + 1, 0)]
-            aqk_c00_2 = sAccum[(group_id + 8, warp_col_base + tid_in_group * 2, 0)]
-            aqk_c00_3 = sAccum[(group_id + 8, warp_col_base + tid_in_group * 2 + 1, 0)]
-            aqk_c01_0 = sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2, 0)]
-            aqk_c01_1 = sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2 + 1, 0)]
-            aqk_c01_2 = sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2, 0)]
-            aqk_c01_3 = sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2 + 1, 0)]
-        
-        # Aqk MMA loop
-        for k_iter in cutlass.range_constexpr(2):
-            k = k_start + k_iter #  k_start = warp_id * 2 -> k=0,1; warp 1 -> k=2,3; etc.
+        # ========== Reset accumulators at k_tile == 0 (new t_sub) ==========
+        # Accumulators persist in registers across k_tiles - no sAccum load/store needed!
+        if k_tile == 0:
+            aqk_c00_0 = cutlass.Float32(0.0)
+            aqk_c00_1 = cutlass.Float32(0.0)
+            aqk_c00_2 = cutlass.Float32(0.0)
+            aqk_c00_3 = cutlass.Float32(0.0)
+            aqk_c01_0 = cutlass.Float32(0.0)
+            aqk_c01_1 = cutlass.Float32(0.0)
+            aqk_c01_2 = cutlass.Float32(0.0)
+            aqk_c01_3 = cutlass.Float32(0.0)
             
-            # Load A tile from sQK_f32 (r_qgq)
-            sA_tile = cute.local_tile(sQK_f32[(None, None, stage)], tiler=(16, 8), coord=(0, k))
-            a0, a1, a2, a3 = load_A_tf32(sA_tile, lane_id_mma)
-            
-            # Load B tiles from sG (r_kgk) - shared for both Aqk and Akk
-            sB_tile_0 = cute.local_tile(sG[(None, None, stage)], tiler=(8, 8), coord=(0, k))
-            b0_0, b1_0 = load_B_tf32_from_rowmajor(sB_tile_0, lane_id_mma)
-            
-            aqk_c00_0, aqk_c00_1, aqk_c00_2, aqk_c00_3 = mma_tf32_m16n8k8(a0, a1, a2, a3, b0_0, b1_0, aqk_c00_0, aqk_c00_1, aqk_c00_2, aqk_c00_3)
-            
-            sB_tile_1 = cute.local_tile(sG[(None, None, stage)], tiler=(8, 8), coord=(1, k))
-            b0_1, b1_1 = load_B_tf32_from_rowmajor(sB_tile_1, lane_id_mma)
-            
-            aqk_c01_0, aqk_c01_1, aqk_c01_2, aqk_c01_3 = mma_tf32_m16n8k8(a0, a1, a2, a3, b0_1, b1_1, aqk_c01_0, aqk_c01_1, aqk_c01_2, aqk_c01_3)
+            akk_c00_0 = cutlass.Float32(0.0)
+            akk_c00_1 = cutlass.Float32(0.0)
+            akk_c00_2 = cutlass.Float32(0.0)
+            akk_c00_3 = cutlass.Float32(0.0)
+            akk_c01_0 = cutlass.Float32(0.0)
+            akk_c01_1 = cutlass.Float32(0.0)
+            akk_c01_2 = cutlass.Float32(0.0)
+            akk_c01_3 = cutlass.Float32(0.0)
+        # k_tile > 0: accumulators already have partial sums from previous k_tile in registers!
         
-        # Store Aqk partial result to sAccum[:, :, 0]
-        sAccum[(group_id, warp_col_base + tid_in_group * 2, 0)] = aqk_c00_0
-        sAccum[(group_id, warp_col_base + tid_in_group * 2 + 1, 0)] = aqk_c00_1
-        sAccum[(group_id + 8, warp_col_base + tid_in_group * 2, 0)] = aqk_c00_2
-        sAccum[(group_id + 8, warp_col_base + tid_in_group * 2 + 1, 0)] = aqk_c00_3
-        sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2, 0)] = aqk_c01_0
-        sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_1
-        sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2, 0)] = aqk_c01_2
-        sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_3
-        
-        # ========== Write r_kgq to sQK_f32 (overwrite r_qgq) ==========
-        cute.arch.barrier()
-        for ri in range(4):
-            r = row_base + ri
-            sQK_f32[(r, col_base, stage)] = r_kgq[(ri, 0)]
-            sQK_f32[(r, col_base + 1, stage)] = r_kgq[(ri, 1)]
-        cute.arch.barrier()
-        
-        # ========== Akk MMA (A = r_kgq, now in sQK_f32) ==========
-        # Initialize accumulators first (CuTe DSL requires init before control flow)
-        akk_c00_0 = cutlass.Float32(0.0)
-        akk_c00_1 = cutlass.Float32(0.0)
-        akk_c00_2 = cutlass.Float32(0.0)
-        akk_c00_3 = cutlass.Float32(0.0)
-        akk_c01_0 = cutlass.Float32(0.0)
-        akk_c01_1 = cutlass.Float32(0.0)
-        akk_c01_2 = cutlass.Float32(0.0)
-        akk_c01_3 = cutlass.Float32(0.0)
-        
-        # k_tile > 0: Load previous partial sums from sAccum[:, :, 1]
-        if k_tile != 0:
-            akk_c00_0 = sAccum[(group_id, warp_col_base + tid_in_group * 2, 1)]
-            akk_c00_1 = sAccum[(group_id, warp_col_base + tid_in_group * 2 + 1, 1)]
-            akk_c00_2 = sAccum[(group_id + 8, warp_col_base + tid_in_group * 2, 1)]
-            akk_c00_3 = sAccum[(group_id + 8, warp_col_base + tid_in_group * 2 + 1, 1)]
-            akk_c01_0 = sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2, 1)]
-            akk_c01_1 = sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2 + 1, 1)]
-            akk_c01_2 = sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2, 1)]
-            akk_c01_3 = sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2 + 1, 1)]
-        
-        # Akk MMA loop
+        # ========== Fused MMA loop: load B once, compute both Aqk and Akk ==========
         for k_iter in cutlass.range_constexpr(2):
             k = k_start + k_iter
             
-            # Load A tile from sQK_f32 (r_kgq)
-            sA_tile = cute.local_tile(sQK_f32[(None, None, stage)], tiler=(16, 8), coord=(0, k))
-            a0, a1, a2, a3 = load_A_tf32(sA_tile, lane_id_mma)
-            
-            # Load B tiles from sG (r_kgk) - same as before
+            # Load B tiles from sG (r_kgk) - ONCE for both Aqk and Akk!
             sB_tile_0 = cute.local_tile(sG[(None, None, stage)], tiler=(8, 8), coord=(0, k))
             b0_0, b1_0 = load_B_tf32_from_rowmajor(sB_tile_0, lane_id_mma)
-            
-            akk_c00_0, akk_c00_1, akk_c00_2, akk_c00_3 = mma_tf32_m16n8k8(a0, a1, a2, a3, b0_0, b1_0, akk_c00_0, akk_c00_1, akk_c00_2, akk_c00_3)
             
             sB_tile_1 = cute.local_tile(sG[(None, None, stage)], tiler=(8, 8), coord=(1, k))
             b0_1, b1_1 = load_B_tf32_from_rowmajor(sB_tile_1, lane_id_mma)
             
-            akk_c01_0, akk_c01_1, akk_c01_2, akk_c01_3 = mma_tf32_m16n8k8(a0, a1, a2, a3, b0_1, b1_1, akk_c01_0, akk_c01_1, akk_c01_2, akk_c01_3)
-        
-        # Store Akk partial result to sAccum[:, :, 1]
-        sAccum[(group_id, warp_col_base + tid_in_group * 2, 1)] = akk_c00_0
-        sAccum[(group_id, warp_col_base + tid_in_group * 2 + 1, 1)] = akk_c00_1
-        sAccum[(group_id + 8, warp_col_base + tid_in_group * 2, 1)] = akk_c00_2
-        sAccum[(group_id + 8, warp_col_base + tid_in_group * 2 + 1, 1)] = akk_c00_3
-        sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2, 1)] = akk_c01_0
-        sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2 + 1, 1)] = akk_c01_1
-        sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2, 1)] = akk_c01_2
-        sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2 + 1, 1)] = akk_c01_3
-        
-        cute.arch.barrier()
+            # Load A tile for Aqk (r_qgq from slot 0)
+            sA_tile_aqk = cute.local_tile(sQK_f32[(None, None, 0)], tiler=(16, 8), coord=(0, k))
+            a0_aqk, a1_aqk, a2_aqk, a3_aqk = load_A_tf32(sA_tile_aqk, lane_id_mma)
+            
+            # Aqk MMA
+            aqk_c00_0, aqk_c00_1, aqk_c00_2, aqk_c00_3 = mma_tf32_m16n8k8(a0_aqk, a1_aqk, a2_aqk, a3_aqk, b0_0, b1_0, aqk_c00_0, aqk_c00_1, aqk_c00_2, aqk_c00_3)
+            aqk_c01_0, aqk_c01_1, aqk_c01_2, aqk_c01_3 = mma_tf32_m16n8k8(a0_aqk, a1_aqk, a2_aqk, a3_aqk, b0_1, b1_1, aqk_c01_0, aqk_c01_1, aqk_c01_2, aqk_c01_3)
+            
+            # Load A tile for Akk (r_kgq from slot 1)
+            sA_tile_akk = cute.local_tile(sQK_f32[(None, None, 1)], tiler=(16, 8), coord=(0, k))
+            a0_akk, a1_akk, a2_akk, a3_akk = load_A_tf32(sA_tile_akk, lane_id_mma)
+            
+            # Akk MMA (reuse b0_0, b1_0, b0_1, b1_1!)
+            akk_c00_0, akk_c00_1, akk_c00_2, akk_c00_3 = mma_tf32_m16n8k8(a0_akk, a1_akk, a2_akk, a3_akk, b0_0, b1_0, akk_c00_0, akk_c00_1, akk_c00_2, akk_c00_3)
+            akk_c01_0, akk_c01_1, akk_c01_2, akk_c01_3 = mma_tf32_m16n8k8(a0_akk, a1_akk, a2_akk, a3_akk, b0_1, b1_1, akk_c01_0, akk_c01_1, akk_c01_2, akk_c01_3)
         
         # 6. Reduction: only after processing all k_tiles for this t_sub
+        # Accumulators stay in registers until final k_tile - then store to sAccum for cross-warp reduction
         if k_tile == num_k_tiles - 1:
-            # Sum all 4 warps' partial results for both Aqk and Akk
-            # 128 threads, 16x16=256 elements, so 2 elements per thread
-            elem_idx = tidx * 2
-            if elem_idx < BC * BC:
-                row0 = elem_idx // BC
-                col0 = elem_idx % BC
-                row1 = (elem_idx + 1) // BC
-                col1 = (elem_idx + 1) % BC
-                
-                # Aqk reduction with scale, apply mask (row >= col)
-                sum_aqk_0 = sAccum[(row0, col0, 0)] + sAccum[(row0, col0 + 16, 0)] + sAccum[(row0, col0 + 32, 0)] + sAccum[(row0, col0 + 48, 0)]
-                sum_aqk_1 = sAccum[(row1, col1, 0)] + sAccum[(row1, col1 + 16, 0)] + sAccum[(row1, col1 + 32, 0)] + sAccum[(row1, col1 + 48, 0)]
-                # mask: row >= col (lower triangular with diagonal), else 0
-                if row0 >= col0:
-                    sAccum[(row0, col0, 0)] = sum_aqk_0 * scale
-                else:
-                    sAccum[(row0, col0, 0)] = cutlass.Float32(0.0)
-                if row1 >= col1:
-                    sAccum[(row1, col1, 0)] = sum_aqk_1 * scale
-                else:
-                    sAccum[(row1, col1, 0)] = cutlass.Float32(0.0)
-                
-                # Akk reduction with beta, apply mask (row > col)
-                # beta index: t_sub * BC + row (within BT range)
-                beta_idx_0 = t_sub * BC + row0
-                beta_idx_1 = t_sub * BC + row1
-                beta_0 = cutlass.Float32(sBeta[(beta_idx_0,)])
-                beta_1 = cutlass.Float32(sBeta[(beta_idx_1,)])
-                
-                sum_akk_0 = sAccum[(row0, col0, 1)] + sAccum[(row0, col0 + 16, 1)] + sAccum[(row0, col0 + 32, 1)] + sAccum[(row0, col0 + 48, 1)]
-                sum_akk_1 = sAccum[(row1, col1, 1)] + sAccum[(row1, col1 + 16, 1)] + sAccum[(row1, col1 + 32, 1)] + sAccum[(row1, col1 + 48, 1)]
-                # mask: row > col (strictly lower triangular), else 0
-                if row0 > col0:
-                    sAccum[(row0, col0, 1)] = sum_akk_0 * beta_0
-                else:
-                    sAccum[(row0, col0, 1)] = cutlass.Float32(0.0)
-                if row1 > col1:
-                    sAccum[(row1, col1, 1)] = sum_akk_1 * beta_1
-                else:
-                    sAccum[(row1, col1, 1)] = cutlass.Float32(0.0)
+            # Store final accumulated results to sAccum (only once per t_sub!)
+            sAccum[(group_id, warp_col_base + tid_in_group * 2, 0)] = aqk_c00_0
+            sAccum[(group_id, warp_col_base + tid_in_group * 2 + 1, 0)] = aqk_c00_1
+            sAccum[(group_id + 8, warp_col_base + tid_in_group * 2, 0)] = aqk_c00_2
+            sAccum[(group_id + 8, warp_col_base + tid_in_group * 2 + 1, 0)] = aqk_c00_3
+            sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2, 0)] = aqk_c01_0
+            sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_1
+            sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2, 0)] = aqk_c01_2
+            sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_3
+            
+            sAccum[(group_id, warp_col_base + tid_in_group * 2, 1)] = akk_c00_0
+            sAccum[(group_id, warp_col_base + tid_in_group * 2 + 1, 1)] = akk_c00_1
+            sAccum[(group_id + 8, warp_col_base + tid_in_group * 2, 1)] = akk_c00_2
+            sAccum[(group_id + 8, warp_col_base + tid_in_group * 2 + 1, 1)] = akk_c00_3
+            sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2, 1)] = akk_c01_0
+            sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2 + 1, 1)] = akk_c01_1
+            sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2, 1)] = akk_c01_2
+            sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2 + 1, 1)] = akk_c01_3
             
             cute.arch.barrier()
-        
-            # 7. Apply mask and write back to global memory
-            # Aqk: mask m_Aqk = (row >= col), i.e., lower triangular including diagonal
-            # Akk: mask m_Akk = (row > col), i.e., strictly lower triangular
+            # Each warp handles 4 rows (4 warps * 4 rows = 16 = BC)
+            # Use shuffle to reduce across 4 warps' partial sums
             #
-            # Output layout:
-            #   Aqk_tensor: (B, T, H, BT) -> write to [i_b, t_abs_base + row, i_h, t_sub * BC + col]
-            #   Akk_tensor: (B, T, H, BC) -> write to [i_b, t_abs_base + row, i_h, col]
+            # sAccum layout: (BC=16, BC*NUM_WARPS=64, 2)
+            #   col 0..15 = warp0, col 16..31 = warp1, col 32..47 = warp2, col 48..63 = warp3
+            # Goal: final[row, col] = sum(sAccum[row, col + warp*16]) for warp in 0..3
+            
             t_abs_base = t_start + t_sub * BC
             
-            # 128 threads, 256 elements, 2 elements per thread
-            linear = tidx
-            while linear < (BC * BC):
-                row = linear // BC
-                col = linear % BC
+            for local_row in cutlass.range_constexpr(4):
+                row = warp_id * 4 + local_row
                 
-                # Read from reduced sAccum[:, 0:16, :] (scale/beta and mask already applied)
-                val_aqk = sAccum[(row, col, 0)]  # fp32, masked with 0 for upper triangle
-                val_akk = sAccum[(row, col, 1)]  # fp32, masked with 0 for upper triangle + diagonal
+                # 32 threads read 64 elements (2 per thread, stride 32)
+                # Thread i reads col i and col i+32 (consecutive access, no bank conflict)
+                col_a = lane_id        # 0..31
+                col_b = lane_id + 32   # 32..63
                 
-                # Direct write back (mask already applied in reduction)
-                Aqk_tensor[(i_b, t_abs_base + row, i_h, t_sub * BC + col)] = cutlass.Float16(val_aqk)
-                Akk_tensor[(i_b, t_abs_base + row, i_h, col)] = val_akk
+                # Read Aqk and Akk partial sums
+                val_a_aqk = sAccum[(row, col_a, 0)]
+                val_b_aqk = sAccum[(row, col_b, 0)]
+                val_a_akk = sAccum[(row, col_a, 1)]
+                val_b_akk = sAccum[(row, col_b, 1)]
                 
-                linear = linear + NUM_THREADS
+                # Step 1: Add elements 32 apart
+                # Thread 0..15 now has: warp0[i] + warp2[i]
+                # Thread 16..31 now has: warp1[i-16] + warp3[i-16]
+                sum_aqk = val_a_aqk + val_b_aqk
+                sum_akk = val_a_akk + val_b_akk
+                
+                # Step 2: shfl_xor(16) exchanges between thread i and thread i^16
+                # Thread 0 <-> Thread 16, Thread 1 <-> Thread 17, etc.
+                partner_aqk = cute.arch.shuffle_sync_bfly(sum_aqk, offset=16, mask=-1, mask_and_clamp=31)
+                partner_akk = cute.arch.shuffle_sync_bfly(sum_akk, offset=16, mask=-1, mask_and_clamp=31)
+                
+                # Step 3: Final reduction (all 4 warps summed)
+                final_aqk = sum_aqk + partner_aqk
+                final_akk = sum_akk + partner_akk
+                
+                # Step 4: First 16 threads apply mask, scale/beta, and write back to global
+                if lane_id < 16:
+                    col = lane_id
+                    
+                    # Initialize outputs before control flow (CuTe DSL requirement)
+                    val_aqk_out = cutlass.Float32(0.0)
+                    val_akk_out = cutlass.Float32(0.0)
+                    
+                    # Aqk: mask row >= col (lower triangular with diagonal)
+                    if row >= col:
+                        val_aqk_out = final_aqk * scale
+                    
+                    # Akk: mask row > col (strictly lower triangular)
+                    beta_idx = t_sub * BC + row
+                    beta_val = cutlass.Float32(sBeta[(beta_idx,)])
+                    if row > col:
+                        val_akk_out = final_akk * beta_val
+                    
+                    # Write directly to global memory
+                    Aqk_tensor[(i_b, t_abs_base + row, i_h, t_sub * BC + col)] = cutlass.Float16(val_aqk_out)
+                    Akk_tensor[(i_b, t_abs_base + row, i_h, col)] = val_akk_out
 
         cute.arch.barrier()
 
@@ -677,17 +644,21 @@ def run_kda_Akk(
         stride=(BK, 1, BC * BK)
     )
     
-    # Float32 smem for r_qgq (separate allocation, not reusing sQK)
-    # (BC, BK, NUM_STAGES) = (16, 64, 2)
+    # Float32 smem for r_qgq and r_kgq (both stored, allows fused MMA loop)
+    # (BC, BK, 2) = (16, 64, 2) - slot 0 for r_qgq, slot 1 for r_kgq
     qk_smem_layout_f32 = cute.make_layout(
-        (BC, BK, NUM_STAGES),
+        (BC, BK, 2),
         stride=(BK, 1, BC * BK)
     )
     
     # accum: (BC, BC * NUM_WARPS, 2) for Aqk (slot 0) and Akk (slot 1)
+    # Row-major with slot as outermost dimension (two separate stages)
+    # Add 8 floats padding per row to reduce bank conflict
+    # row_stride = 64 + 8 = 72, 72 % 32 = 8 → reduces to 2-way conflict
+    ACCUM_ROW_STRIDE = BC * NUM_WARPS + 8  # 72 (col_count + padding)
     accum_smem_layout = cute.make_layout(
         (BC, BC * NUM_WARPS, 2),
-        stride=(BC * NUM_WARPS * 2, 2, 1)
+        stride=(ACCUM_ROW_STRIDE, 1, BC * ACCUM_ROW_STRIDE)
     )
 
     # beta: (BT,) fp16
@@ -699,13 +670,15 @@ def run_kda_Akk(
     # SMEM size calculation
     # g: 16 * 64 * 2 * 4 bytes = 8192 bytes
     # qk (fp16): 16 * 64 * 4 * 2 bytes = 8192 bytes
-    # qk_f32: 16 * 64 * 2 * 4 bytes = 8192 bytes (separate allocation)
-    # accum: 16 * 64 * 2 * 4 bytes = 8192 bytes (Aqk + Akk)
+    # qk_f32: 16 * 64 * 2 * 4 bytes = 8192 bytes (2 slots: r_qgq + r_kgq)
+    # accum: with padding, two separate stages
+    #        max_offset = (BC-1)*72 + (64-1)*1 + 1*1152 + 1 = 2296 floats
     # beta: BT * 2 bytes
+    accum_max_offset = (BC - 1) * ACCUM_ROW_STRIDE + (BC * NUM_WARPS - 1) + BC * ACCUM_ROW_STRIDE + 1
     smem_bytes = (4 * BC * BK * NUM_STAGES +       # sG
                   2 * BC * BK * NUM_STAGES * 2 +   # sQK (fp16)
-                  4 * BC * BK * NUM_STAGES +       # sQK_f32 (fp32, separate)
-                  4 * BC * BC * NUM_WARPS * 2 +    # sAccum (2 slots: Aqk, Akk)
+                  4 * BC * BK * 2 +                # sQK_f32 (fp32, 2 slots)
+                  4 * accum_max_offset +           # sAccum (with padding)
                   2 * BT +                          # sBeta
                   128)                              # alignment
     
@@ -953,7 +926,7 @@ if __name__ == "__main__":
         cute_mean_ms = prof_ms.mean().item()
         min_ms = prof_ms.min().item()
         bw_gibs = data_gib / (cute_mean_ms / 1000.0)
-        peak_bw = 4814
+        peak_bw = 7872
         peak_pct = bw_gibs / peak_bw * 100.0
         print(f"  Bytes (read/write/total): {read_bytes} / {write_bytes} / {data_bytes}")
         print(f"  Profiler Mean: {cute_mean_ms:.4f} ms (kernel_cutlass only)")
