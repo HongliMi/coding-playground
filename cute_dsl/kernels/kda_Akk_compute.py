@@ -151,6 +151,10 @@ NUM_STAGES = 2   # double buffer
 NUM_THREADS = 128
 NUM_WARPS = 4
 
+# 峰值带宽 (GB/s) - 根据不同 GPU 平台修改
+# B200: 8000, H100 SXM: 3350, H100 PCIe: 2000, A100 SXM: 2039, A100 PCIe: 1555
+PEAK_BW_GBS = 7672  # B200
+
 
 @cute.kernel
 def kda_Akk_kernel(
@@ -632,9 +636,11 @@ def run_kda_Akk(
     
     # =============== SMEM layouts ===============
     # g: (BC, BK, NUM_STAGES) = (16, 64, 2)
+    # Add 8 columns padding to reduce bank conflict: row_stride = 64 + 8 = 72
+    G_ROW_STRIDE = BK + 8  # 72
     g_smem_layout = cute.make_layout(
         (BC, BK, NUM_STAGES),
-        stride=(BK, 1, BC * BK)
+        stride=(G_ROW_STRIDE, 1, BC * G_ROW_STRIDE)
     )
     # q and k share smem with interleaved stages: (BC, BK, NUM_STAGES * 2)
     # Interleaved layout: [q0][k0][q1][k1] so q and k for same stage are adjacent
@@ -646,9 +652,11 @@ def run_kda_Akk(
     
     # Float32 smem for r_qgq and r_kgq (both stored, allows fused MMA loop)
     # (BC, BK, 2) = (16, 64, 2) - slot 0 for r_qgq, slot 1 for r_kgq
+    # Add 8 columns padding to reduce bank conflict: row_stride = 64 + 8 = 72, 72 % 32 = 8
+    QK_F32_ROW_STRIDE = BK + 8  # 72
     qk_smem_layout_f32 = cute.make_layout(
         (BC, BK, 2),
-        stride=(BK, 1, BC * BK)
+        stride=(QK_F32_ROW_STRIDE, 1, BC * QK_F32_ROW_STRIDE)
     )
     
     # accum: (BC, BC * NUM_WARPS, 2) for Aqk (slot 0) and Akk (slot 1)
@@ -668,19 +676,19 @@ def run_kda_Akk(
     )
     
     # SMEM size calculation
-    # g: 16 * 64 * 2 * 4 bytes = 8192 bytes
+    # g: 16 * 72 * 2 * 4 bytes = 9216 bytes (with 8-col padding)
     # qk (fp16): 16 * 64 * 4 * 2 bytes = 8192 bytes
-    # qk_f32: 16 * 64 * 2 * 4 bytes = 8192 bytes (2 slots: r_qgq + r_kgq)
+    # qk_f32: 16 * 72 * 2 * 4 bytes = 9216 bytes (2 slots: r_qgq + r_kgq, with 8-col padding)
     # accum: with padding, two separate stages
     #        max_offset = (BC-1)*72 + (64-1)*1 + 1*1152 + 1 = 2296 floats
     # beta: BT * 2 bytes
     accum_max_offset = (BC - 1) * ACCUM_ROW_STRIDE + (BC * NUM_WARPS - 1) + BC * ACCUM_ROW_STRIDE + 1
-    smem_bytes = (4 * BC * BK * NUM_STAGES +       # sG
-                  2 * BC * BK * NUM_STAGES * 2 +   # sQK (fp16)
-                  4 * BC * BK * 2 +                # sQK_f32 (fp32, 2 slots)
-                  4 * accum_max_offset +           # sAccum (with padding)
-                  2 * BT +                          # sBeta
-                  128)                              # alignment
+    smem_bytes = (4 * BC * G_ROW_STRIDE * NUM_STAGES +  # sG (with 8-col padding)
+                  2 * BC * BK * NUM_STAGES * 2 +        # sQK (fp16)
+                  4 * BC * QK_F32_ROW_STRIDE * 2 +      # sQK_f32 (fp32, 2 slots, with 8-col padding)
+                  4 * accum_max_offset +                # sAccum (with padding)
+                  2 * BT +                               # sBeta
+                  128)                                   # alignment
     
     print(f"KDA Akk: B={B}, T={seq_len}, H={H}, K={K}")
     print(f"  Tiles: NT={NT}, num_k_tiles={num_k_tiles}")
@@ -828,17 +836,17 @@ if __name__ == "__main__":
     print(f"  mean|CuTe - Triton| = {mean_diff_akk:.6e}")
     
     # Print sample for inspection (b=0, h=0, first sub-chunk)
-    print("\n--- Sample: Aqk[0, 0:8, 0, 0:8] ---")
-    print("CuTe:")
-    print(Aqk[0, 0:8, 0, 0:8].detach().cpu())
-    print("Triton:")
-    print(Aqk_ref[0, 0:8, 0, 0:8].detach().cpu())
+    # print("\n--- Sample: Aqk[0, 0:8, 0, 0:8] ---")
+    # print("CuTe:")
+    # print(Aqk[0, 0:8, 0, 0:8].detach().cpu())
+    # print("Triton:")
+    # print(Aqk_ref[0, 0:8, 0, 0:8].detach().cpu())
     
-    print("\n--- Sample: Akk[0, 0:8, 0, 0:8] ---")
-    print("CuTe:")
-    print(Akk[0, 0:8, 0, 0:8].detach().cpu())
-    print("Triton:")
-    print(Akk_ref[0, 0:8, 0, 0:8].detach().cpu())
+    # print("\n--- Sample: Akk[0, 0:8, 0, 0:8] ---")
+    # print("CuTe:")
+    # print(Akk[0, 0:8, 0, 0:8].detach().cpu())
+    # print("Triton:")
+    # print(Akk_ref[0, 0:8, 0, 0:8].detach().cpu())
     
     # Pass/Fail check
     # TF32 MMA has ~1e-3 relative error, so use relaxed thresholds
@@ -850,15 +858,49 @@ if __name__ == "__main__":
     else:
         print(f"\n✓ PASS: Results match within tolerance")
     
-    # Benchmark (torch.profiler only)
+    # Benchmark
     print(f"\nBenchmarking: {test_iters} iterations...")
 
     # L2 cache eviction buffer (match benchmark_all.py idea)
     dummy_buffer = torch.empty(int(80 * 1024 * 1024 / 4), dtype=torch.float32, device='cuda')
 
-    if not use_profiler:
-        raise SystemExit("use_profiler=False is not supported (CUDA Events timing removed).")
+    # =============== CUDA Event Timing ===============
+    print(f"\nCUDA Event Timing: {test_iters} iterations...")
+    
+    # Create CUDA events
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    cuda_event_times_ms = []
+    for i in range(test_iters):
+        # Evict L2 cache
+        _ = dummy_buffer.sum()
+        torch.cuda.synchronize()
+        
+        # Record start
+        start_event.record()
+        
+        # Run kernel
+        compiled(g_tensor, q_tensor, k_tensor, beta_tensor, Akk_tensor, Aqk_tensor, scale, stream)
+        
+        # Record end
+        end_event.record()
+        
+        # Synchronize and get elapsed time
+        torch.cuda.synchronize()
+        elapsed_ms = start_event.elapsed_time(end_event)
+        cuda_event_times_ms.append(elapsed_ms)
+    
+    cuda_event_times = torch.tensor(cuda_event_times_ms, dtype=torch.float64)
+    cuda_event_mean_ms = cuda_event_times.mean().item()
+    cuda_event_min_ms = cuda_event_times.min().item()
+    cuda_event_std_ms = cuda_event_times.std().item()
+    
+    print(f"  ✓ CUDA Event Mean: {cuda_event_mean_ms:.4f} ms")
+    print(f"  ✓ CUDA Event Min:  {cuda_event_min_ms:.4f} ms")
+    print(f"  ✓ CUDA Event Std:  {cuda_event_std_ms:.4f} ms")
 
+    # =============== torch.profiler Timing ===============
     print(f"\nProfiling with torch.profiler: {test_iters} iterations...")
     profiler = torch.profiler.profile(
         activities=[
@@ -905,44 +947,27 @@ if __name__ == "__main__":
         profiler_times_us = []
     
     # Data size (bytes moved by this debug kernel)
-    # - Read:  g(fp32) + q(fp16) + k(fp16)  -> full K
-    #          beta(fp16)                   -> BT per token (here modeled as full seq_len)
-    # - Write: Akk(fp32) -> only first BC columns
-    #          Aqk(fp16) -> only first BC columns (even though Aqk is allocated with BT columns)
     read_bytes = B * seq_len * H * K * (4 + 2 + 2) + (B * seq_len * H * 2)
     write_bytes = (B * seq_len * H * BC * 4) + (B * seq_len * H * BC * 2)
     data_bytes = read_bytes + write_bytes
     data_mb = data_bytes / 1024 / 1024
-    # Use decimal GB to match "peak bandwidth = 8192" convention
     data_gib = data_bytes / 1000 / 1000 / 1000
+    peak_bw = PEAK_BW_GBS
     
-    print("\n" + "=" * 50)
-    print(f"✓ CuTe Results:")
-    print(f"  Data: {data_mb:.2f} MB")
-    cute_mean_ms = None
+    # CuTe metrics
+    cute_bw_cuda = data_gib / (cuda_event_mean_ms / 1000.0)
+    cute_peak_cuda = cute_bw_cuda / peak_bw * 100.0
+    
+    cute_profiler_mean_ms = 0.0
+    cute_bw_profiler = 0.0
+    cute_peak_profiler = 0.0
     if len(profiler_times_us) > 0:
-        prof = torch.tensor(profiler_times_us, dtype=torch.float64)
-        prof_ms = prof / 1000.0
-        cute_mean_ms = prof_ms.mean().item()
-        min_ms = prof_ms.min().item()
-        bw_gibs = data_gib / (cute_mean_ms / 1000.0)
-        peak_bw = 7872
-        peak_pct = bw_gibs / peak_bw * 100.0
-        print(f"  Bytes (read/write/total): {read_bytes} / {write_bytes} / {data_bytes}")
-        print(f"  Profiler Mean: {cute_mean_ms:.4f} ms (kernel_cutlass only)")
-        print(f"  Profiler Min:  {min_ms:.4f} ms (kernel_cutlass only)")
-        print(f"  BW (profiler mean): {bw_gibs:.1f} GB/s")
-        print(f"  Peak% (peak={peak_bw:.0f}): {peak_pct:.2f}%")
-        if len(profiler_times_us) != test_iters:
-            print(f"  Note: kernel_count={len(profiler_times_us)} != test_iters={test_iters} (mean is over kernel events).")
-    else:
-        print("  ✗ No kernel timings parsed; bandwidth unavailable.")
-    print("=" * 50)
+        cute_profiler_mean_ms = torch.tensor(profiler_times_us, dtype=torch.float64).mean().item() / 1000.0
+        cute_bw_profiler = data_gib / (cute_profiler_mean_ms / 1000.0)
+        cute_peak_profiler = cute_bw_profiler / peak_bw * 100.0
     
     # =============== Triton Benchmark ===============
-    print(f"\n" + "=" * 50)
-    print(f"Triton Benchmark: {test_iters} iterations...")
-    print("=" * 50)
+    print(f"\nTriton Benchmark ({test_iters} iters)...")
     
     # Warmup
     for _ in range(10):
@@ -954,85 +979,97 @@ if __name__ == "__main__":
         )
     torch.cuda.synchronize()
     
-    # Profile Triton
-    profiler_triton = torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        record_shapes=True,
-        with_stack=False,
-    )
+    # CUDA Event Timing for Triton
+    triton_cuda_event_times_ms = []
+    for i in range(test_iters):
+        _ = dummy_buffer.sum()
+        torch.cuda.synchronize()
+        start_event.record()
+        chunk_kda_fwd_kernel_intra_sub_chunk[grid](
+            q=q, k=k, g=g, beta=beta, Aqk=Aqk_ref, Akk=Akk_ref, scale=scale,
+            cu_seqlens=None, chunk_indices=None,
+            T=seq_len, H=H, K=K, BT=BT, BC=BC, BK=BK_triton,
+            IS_VARLEN=False, USE_GATHER=IS_GATHER_SUPPORTED,
+        )
+        end_event.record()
+        torch.cuda.synchronize()
+        triton_cuda_event_times_ms.append(start_event.elapsed_time(end_event))
     
+    triton_cuda_event_times = torch.tensor(triton_cuda_event_times_ms, dtype=torch.float64)
+    triton_cuda_event_mean_ms = triton_cuda_event_times.mean().item()
+    
+    # torch.profiler Timing for Triton
+    profiler_triton = torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=True, with_stack=False,
+    )
     with profiler_triton:
         for i in range(test_iters):
             _ = dummy_buffer.sum()
             torch.cuda.synchronize()
-            with torch.profiler.record_function(f"triton_iter{i}"):
-                chunk_kda_fwd_kernel_intra_sub_chunk[grid](
-                    q=q, k=k, g=g, beta=beta, Aqk=Aqk_ref, Akk=Akk_ref, scale=scale,
-                    cu_seqlens=None, chunk_indices=None,
-                    T=seq_len, H=H, K=K, BT=BT, BC=BC, BK=BK_triton,
-                    IS_VARLEN=False, USE_GATHER=IS_GATHER_SUPPORTED,
-                )
+            chunk_kda_fwd_kernel_intra_sub_chunk[grid](
+                q=q, k=k, g=g, beta=beta, Aqk=Aqk_ref, Akk=Akk_ref, scale=scale,
+                cu_seqlens=None, chunk_indices=None,
+                T=seq_len, H=H, K=K, BT=BT, BC=BC, BK=BK_triton,
+                IS_VARLEN=False, USE_GATHER=IS_GATHER_SUPPORTED,
+            )
             torch.cuda.synchronize()
     
     trace_file_triton = os.path.join(trace_dir, "kda_Akk_triton.json")
     profiler_triton.export_chrome_trace(trace_file_triton)
-    print(f"  ✓ Triton profiler trace saved to {trace_file_triton}")
     
     triton_times_us = []
     try:
         with open(trace_file_triton, "r") as f:
             trace_data = json.load(f)
         for event in trace_data.get("traceEvents", []):
-            if event.get("cat") != "kernel":
-                continue
-            name = event.get("name", "")
-            dur = event.get("dur", 0)
-            # Extract Triton kernels (usually named chunk_kda_fwd_kernel_intra_sub_chunk or similar)
-            if dur > 0 and "chunk_kda" in name.lower():
-                triton_times_us.append(dur)
-        if triton_times_us:
-            print(f"  ✓ Parsed {len(triton_times_us)} Triton kernel timings from profiler trace")
-        else:
-            print("  ⚠ No Triton kernel timings found in profiler trace")
-    except Exception as e:
-        print(f"  ✗ Failed to parse Triton profiler trace: {e}")
-        triton_times_us = []
+            if event.get("cat") == "kernel":
+                name = event.get("name", "")
+                dur = event.get("dur", 0)
+                if dur > 0 and "chunk_kda" in name.lower():
+                    triton_times_us.append(dur)
+    except:
+        pass
     
-    print("\n" + "=" * 50)
-    print(f"✓ Triton Results:")
-    triton_mean_ms = None
+    # Triton metrics
+    triton_bw_cuda = data_gib / (triton_cuda_event_mean_ms / 1000.0)
+    triton_peak_cuda = triton_bw_cuda / peak_bw * 100.0
+    
+    triton_profiler_mean_ms = 0.0
+    triton_bw_profiler = 0.0
+    triton_peak_profiler = 0.0
     if len(triton_times_us) > 0:
-        prof_triton = torch.tensor(triton_times_us, dtype=torch.float64)
-        prof_triton_ms = prof_triton / 1000.0
-        triton_mean_ms = prof_triton_ms.mean().item()
-        triton_min_ms = prof_triton_ms.min().item()
-        triton_bw_gibs = data_gib / (triton_mean_ms / 1000.0)
-        triton_peak_pct = triton_bw_gibs / peak_bw * 100.0
-        print(f"  Profiler Mean: {triton_mean_ms:.4f} ms")
-        print(f"  Profiler Min:  {triton_min_ms:.4f} ms")
-        print(f"  BW (profiler mean): {triton_bw_gibs:.1f} GB/s")
-        print(f"  Peak% (peak={peak_bw:.0f}): {triton_peak_pct:.2f}%")
-    else:
-        print("  ✗ No kernel timings parsed; bandwidth unavailable.")
-    print("=" * 50)
+        triton_profiler_mean_ms = torch.tensor(triton_times_us, dtype=torch.float64).mean().item() / 1000.0
+        triton_bw_profiler = data_gib / (triton_profiler_mean_ms / 1000.0)
+        triton_peak_profiler = triton_bw_profiler / peak_bw * 100.0
     
-    # Summary comparison
-    print("\n" + "=" * 50)
-    print("Performance Comparison:")
-    print("=" * 50)
-    if cute_mean_ms and triton_mean_ms:
-        speedup = triton_mean_ms / cute_mean_ms
-        print(f"  CuTe Mean:   {cute_mean_ms:.4f} ms")
-        print(f"  Triton Mean: {triton_mean_ms:.4f} ms")
-        print(f"  Speedup (Triton/CuTe): {speedup:.2f}x")
-        if speedup > 1:
-            print(f"  → CuTe is {speedup:.2f}x FASTER than Triton")
-        else:
-            print(f"  → Triton is {1/speedup:.2f}x FASTER than CuTe")
-    print("=" * 50)
+    # =============== Summary Table ===============
+    print("\n" + "=" * 80)
+    print(f"Performance Summary (B={B}, T={seq_len}, H={H}, K={K}, Data={data_mb:.1f}MB, Peak={peak_bw}GB/s)")
+    print("=" * 80)
+    print(f"{'Metric':<20} | {'CuTe':<18} | {'Triton':<18} | {'Speedup':<10}")
+    print("-" * 80)
+    
+    # CUDA Event row
+    speedup_cuda = triton_cuda_event_mean_ms / cuda_event_mean_ms
+    print(f"{'CUDA Event (ms)':<20} | {cuda_event_mean_ms:<18.4f} | {triton_cuda_event_mean_ms:<18.4f} | {speedup_cuda:<10.2f}x")
+    print(f"{'  → BW (GB/s)':<20} | {cute_bw_cuda:<18.1f} | {triton_bw_cuda:<18.1f} |")
+    print(f"{'  → Peak%':<20} | {cute_peak_cuda:<18.2f} | {triton_peak_cuda:<18.2f} |")
+    
+    # Profiler row
+    if cute_profiler_mean_ms > 0 and triton_profiler_mean_ms > 0:
+        speedup_profiler = triton_profiler_mean_ms / cute_profiler_mean_ms
+        print("-" * 80)
+        print(f"{'Profiler (ms)':<20} | {cute_profiler_mean_ms:<18.4f} | {triton_profiler_mean_ms:<18.4f} | {speedup_profiler:<10.2f}x")
+        print(f"{'  → BW (GB/s)':<20} | {cute_bw_profiler:<18.1f} | {triton_bw_profiler:<18.1f} |")
+        print(f"{'  → Peak%':<20} | {cute_peak_profiler:<18.2f} | {triton_peak_profiler:<18.2f} |")
+    
+    print("=" * 80)
+    if speedup_cuda > 1:
+        print(f"✓ CuTe is {speedup_cuda:.2f}x FASTER than Triton (CUDA Event)")
+    else:
+        print(f"✗ Triton is {1/speedup_cuda:.2f}x FASTER than CuTe (CUDA Event)")
+    print("=" * 80)
     print("DONE")
     
     del compiled
