@@ -168,7 +168,6 @@ def kda_Akk_kernel(
     Aqk_tensor: cute.Tensor,     # (B, T, H, BT) output (debug: write back loaded q[:, :BC] as fp16 into [:BC])
     g_smem_layout: cute.Layout,  # (BC, BK, NUM_STAGES)
     qk_smem_layout: cute.Layout, # (BC, BK, NUM_STAGES * 2) for q and k
-    qk_smem_layout_f32: cute.Layout, # (BC, BK, 2) float32 for r_qgq (slot 0) and r_kgq (slot 1)
     accum_smem_layout: cute.Layout, # (BC, BC * NUM_WARPS, 2) for Aqk and Akk
     beta_smem_layout: cute.Layout, # (BT,)
     BT: cutlass.Constexpr[int],
@@ -199,10 +198,6 @@ def kda_Akk_kernel(
     # q+k: (BC, BK, NUM_STAGES * 2) fp16 = (16, 64, 4) * 2 bytes = 8KB
     sQK = smem.allocate_tensor(cutlass.Float16, qk_smem_layout, 128)
     
-    # Allocate separate fp32 smem for r_qgq (cannot reuse sQK due to incompatible strides)
-    # (BC, BK, NUM_STAGES) fp32 = (16, 64, 2) * 4 bytes = 8KB
-    sQK_f32 = smem.allocate_tensor(cutlass.Float32, qk_smem_layout_f32, 128)
-
     sAccum = smem.allocate_tensor(cutlass.Float32, accum_smem_layout, 128)
     sBeta = smem.allocate_tensor(cutlass.Float16, beta_smem_layout, 128)
     
@@ -328,127 +323,33 @@ def kda_Akk_kernel(
 
             cute.arch.cp_async_commit_group()
 
-        # =============== Compute (current stage) ===============
-        # 1. compute b_gm (ref: chunk_intra.py)
-        # Layout: 4 warps × 4 rows/warp × 2 cols/thread
-        #   - BC=16 rows, BK=64 cols, 128 threads (4 warps)
-        #   - Each warp handles 4 rows, each thread handles 2 consecutive cols
-        #   - Each thread: 4 rows × 2 cols = 8 elements in registers
+        # =============== Fused Element-wise + MMA (no intermediate SMEM) ===============
+        # Strategy: For each k sub-tile (8 cols), read g/q/k from SMEM, compute element-wise
+        # in registers, then directly do MMA. This eliminates sQK_f32 write/read!
+        #
+        # MMA m16n8k8 layout:
+        #   - group_id = lane_id // 4 (0-7)
+        #   - tid_in_group = lane_id % 4 (0-3)
+        #   - A[16,8]: a0=A[group_id, tid*2], a1=A[group_id+8, tid*2], a2=A[group_id, tid*2+1], a3=A[group_id+8, tid*2+1]
+        #   - B[8,8]:  b0=B[group_id, tid*2], b1=B[group_id, tid*2+1]
+        #
+        # Each warp processes 2 k sub-tiles: warp0 -> k=0,1; warp1 -> k=2,3; etc.
+        
         t_sub = it // num_k_tiles
         k_tile = it - t_sub * num_k_tiles
         t_abs_base = t_start + t_sub * BC
-
-        # gn_row = min(BC//2, max(0, seq_len - t_abs_base - 1))
+        
+        # gn_row for normalization
         gn_row = cutlass.min(BC // 2, cutlass.max(0, seq_len - t_abs_base - 1))
-
-        # Thread mapping
+        
+        # Thread/warp mapping for MMA
         warp_id = tidx // 32
         lane_id = tidx % 32
-        row_base = warp_id * 4      # each warp owns 4 rows
-        col_base = lane_id * 2      # each thread owns 2 consecutive cols
-
-        # Pre-allocate register tensors: (4 rows, 2 cols) per thread
-        # r_qgq = q * exp2(b_gm)  -> for Aqk: dot(q*gq, kgk^T)
-        r_qgq = cute.make_rmem_tensor(
-            cute.make_layout((4, 2), stride=(2, 1)),
-            cutlass.Float32
-        )
-        # r_kgq = k * exp2(b_gm)  -> for Akk: dot(k*gq, kgk^T)
-        r_kgq = cute.make_rmem_tensor(
-            cute.make_layout((4, 2), stride=(2, 1)),
-            cutlass.Float32
-        )
-        # r_kgk = k * exp2(-b_gm) -> B matrix for both Aqk and Akk
-        r_kgk = cute.make_rmem_tensor(
-            cute.make_layout((4, 2), stride=(2, 1)),
-            cutlass.Float32
-        )
-
-        # Load gn values (same row for all, broadcast across columns)
-        gn_val_0 = sG[(gn_row, col_base, stage)]
-        gn_val_1 = sG[(gn_row, col_base + 1, stage)]
-
-        # 2. compute all fused element-wise products in one pass
-        for ri in range(4):
-            r = row_base + ri
-            if t_abs_base + r < seq_len:
-                g_val_0 = sG[(r, col_base, stage)]
-                g_val_1 = sG[(r, col_base + 1, stage)]
-                # Load q values from sQK (interleaved: stage*2)
-                q_val_0 = sQK[(r, col_base, stage * 2)]
-                q_val_1 = sQK[(r, col_base + 1, stage * 2)]
-                # Load k values from sQK (interleaved: stage*2 + 1)
-                k_val_0 = sQK[(r, col_base, stage * 2 + 1)]
-                k_val_1 = sQK[(r, col_base + 1, stage * 2 + 1)]
-                
-                b_gm_0 = g_val_0 - gn_val_0
-                b_gm_1 = g_val_1 - gn_val_1
-                gq_0 = cute.math.exp2(b_gm_0)
-                gq_1 = cute.math.exp2(b_gm_1)
-                gk_0 = cute.math.exp2(-b_gm_0)
-                gk_1 = cute.math.exp2(-b_gm_1)
-                
-                # Fused: q * gq (for Aqk)
-                r_qgq[(ri, 0)] = q_val_0 * gq_0
-                r_qgq[(ri, 1)] = q_val_1 * gq_1
-                # Fused: k * gq (for Akk)
-                r_kgq[(ri, 0)] = k_val_0 * gq_0
-                r_kgq[(ri, 1)] = k_val_1 * gq_1
-                # Fused: k * gk (B matrix, will be transposed in GEMM)
-                r_kgk[(ri, 0)] = k_val_0 * gk_0
-                r_kgk[(ri, 1)] = k_val_1 * gk_1
-            else:
-                # Out of bounds: set to 0 (same as Triton's tl.where(m_c, ..., 0.))
-                r_qgq[(ri, 0)] = cutlass.Float32(0.0)
-                r_qgq[(ri, 1)] = cutlass.Float32(0.0)
-                r_kgq[(ri, 0)] = cutlass.Float32(0.0)
-                r_kgq[(ri, 1)] = cutlass.Float32(0.0)
-                r_kgk[(ri, 0)] = cutlass.Float32(0.0)
-                r_kgk[(ri, 1)] = cutlass.Float32(0.0)
-        
-        # 3. barrier to ensure all threads finished reading q/k from sQK before overwriting
-        cute.arch.barrier()
-        
-        # 4. write r_kgk, r_qgq, and r_kgq to SMEM
-        # r_kgk -> sG[:, :, stage]
-        # r_qgq -> sQK_f32[:, :, 0]
-        # r_kgq -> sQK_f32[:, :, 1]
-        # This allows fused MMA loop: load B once, compute both Aqk and Akk!
-        for ri in range(4):
-            r = row_base + ri
-            sG[(r, col_base, stage)] = r_kgk[(ri, 0)]
-            sG[(r, col_base + 1, stage)] = r_kgk[(ri, 1)]
-            sQK_f32[(r, col_base, 0)] = r_qgq[(ri, 0)]
-            sQK_f32[(r, col_base + 1, 0)] = r_qgq[(ri, 1)]
-            sQK_f32[(r, col_base, 1)] = r_kgq[(ri, 0)]
-            sQK_f32[(r, col_base + 1, 1)] = r_kgq[(ri, 1)]
-        
-        cute.arch.barrier()
-        
-        # 5. Fused MMA: Compute both Aqk and Akk in single loop
-        #   Aqk = r_qgq @ r_kgk^T  -> sAccum[:, :, 0]
-        #   Akk = r_kgq @ r_kgk^T  -> sAccum[:, :, 1]
-        # 
-        # Data in SMEM:
-        #   A matrix (r_qgq): sQK_f32[:, :, 0] - 16x64 fp32
-        #   A matrix (r_kgq): sQK_f32[:, :, 1] - 16x64 fp32
-        #   B matrix (r_kgk): sG[:, :, stage] - 16x64 fp32
-        #
-        # Strategy: Fused MMA - load B once, compute both Aqk and Akk
-        # This halves the sG memory reads!
-        
-        
-        t_sub = it // num_k_tiles # sub_idx
-        k_tile = it - t_sub * num_k_tiles # k_tile_idx
-        
-        lane_id_mma = tidx % 32 # lane_id
-        k_start = warp_id * 2  # warp 0 -> k=0,1; warp 1 -> k=2,3; etc.
-        group_id = lane_id_mma // 4 # group_id
-        tid_in_group = lane_id_mma % 4 # tid_in_group
-        warp_col_base = warp_id * BC  # warp_id * 16
+        group_id = lane_id // 4      # 0-7, determines rows (group_id and group_id+8)
+        tid_in_group = lane_id % 4   # 0-3, determines cols within 8-col tile (tid*2 and tid*2+1)
+        k_start = warp_id * 2        # warp 0 -> k=0,1; warp 1 -> k=2,3; etc.
         
         # ========== Reset accumulators at k_tile == 0 (new t_sub) ==========
-        # Accumulators persist in registers across k_tiles - no sAccum load/store needed!
         if k_tile == 0:
             aqk_c00_0 = cutlass.Float32(0.0)
             aqk_c00_1 = cutlass.Float32(0.0)
@@ -467,99 +368,220 @@ def kda_Akk_kernel(
             akk_c01_1 = cutlass.Float32(0.0)
             akk_c01_2 = cutlass.Float32(0.0)
             akk_c01_3 = cutlass.Float32(0.0)
-        # k_tile > 0: accumulators already have partial sums from previous k_tile in registers!
         
-        # ========== Fused MMA loop: load B once, compute both Aqk and Akk ==========
+        # ========== Fused element-wise + MMA loop ==========
         for k_iter in cutlass.range_constexpr(2):
             k = k_start + k_iter
+            k_offset = k * 8  # column offset for this k sub-tile
+            col = tid_in_group * 2  # 0,2,4,6 within each 8-col tile
             
-            # Load B tiles from sG (r_kgk) - ONCE for both Aqk and Akk!
-            sB_tile_0 = cute.local_tile(sG[(None, None, stage)], tiler=(8, 8), coord=(0, k))
-            b0_0, b1_0 = load_B_tf32_from_rowmajor(sB_tile_0, lane_id_mma)
+            # Row indices for MMA layout
+            r0 = group_id       # rows 0-7
+            r1 = group_id + 8   # rows 8-15
             
-            sB_tile_1 = cute.local_tile(sG[(None, None, stage)], tiler=(8, 8), coord=(1, k))
-            b0_1, b1_1 = load_B_tf32_from_rowmajor(sB_tile_1, lane_id_mma)
+            # ===== Load gn values (for normalization) =====
+            gn_0 = sG[(gn_row, k_offset + col, stage)]
+            gn_1 = sG[(gn_row, k_offset + col + 1, stage)]
             
-            # Load A tile for Aqk (r_qgq from slot 0)
-            sA_tile_aqk = cute.local_tile(sQK_f32[(None, None, 0)], tiler=(16, 8), coord=(0, k))
-            a0_aqk, a1_aqk, a2_aqk, a3_aqk = load_A_tf32(sA_tile_aqk, lane_id_mma)
+            # ===== Row r0 (group_id, 0-7): element-wise for A and B_tile_0 =====
+            g_r0_0 = sG[(r0, k_offset + col, stage)]
+            g_r0_1 = sG[(r0, k_offset + col + 1, stage)]
+            q_r0_0 = sQK[(r0, k_offset + col, stage * 2)]
+            q_r0_1 = sQK[(r0, k_offset + col + 1, stage * 2)]
+            k_r0_0 = sQK[(r0, k_offset + col, stage * 2 + 1)]
+            k_r0_1 = sQK[(r0, k_offset + col + 1, stage * 2 + 1)]
             
-            # Aqk MMA
-            aqk_c00_0, aqk_c00_1, aqk_c00_2, aqk_c00_3 = mma_tf32_m16n8k8(a0_aqk, a1_aqk, a2_aqk, a3_aqk, b0_0, b1_0, aqk_c00_0, aqk_c00_1, aqk_c00_2, aqk_c00_3)
-            aqk_c01_0, aqk_c01_1, aqk_c01_2, aqk_c01_3 = mma_tf32_m16n8k8(a0_aqk, a1_aqk, a2_aqk, a3_aqk, b0_1, b1_1, aqk_c01_0, aqk_c01_1, aqk_c01_2, aqk_c01_3)
+            b_gm_r0_0 = g_r0_0 - gn_0
+            b_gm_r0_1 = g_r0_1 - gn_1
+            gq_r0_0 = cute.math.exp2(b_gm_r0_0)
+            gq_r0_1 = cute.math.exp2(b_gm_r0_1)
+            gk_r0_0 = cute.math.exp2(-b_gm_r0_0)
+            gk_r0_1 = cute.math.exp2(-b_gm_r0_1)
             
-            # Load A tile for Akk (r_kgq from slot 1)
-            sA_tile_akk = cute.local_tile(sQK_f32[(None, None, 1)], tiler=(16, 8), coord=(0, k))
-            a0_akk, a1_akk, a2_akk, a3_akk = load_A_tf32(sA_tile_akk, lane_id_mma)
+            # A for Aqk (q * gq): a0, a2
+            a_aqk_0 = q_r0_0 * gq_r0_0
+            a_aqk_2 = q_r0_1 * gq_r0_1
+            # A for Akk (k * gq): a0, a2
+            a_akk_0 = k_r0_0 * gq_r0_0
+            a_akk_2 = k_r0_1 * gq_r0_1
+            # B_tile_0 (k * gk, rows 0-7)
+            b0_0 = k_r0_0 * gk_r0_0
+            b1_0 = k_r0_1 * gk_r0_1
             
-            # Akk MMA (reuse b0_0, b1_0, b0_1, b1_1!)
-            akk_c00_0, akk_c00_1, akk_c00_2, akk_c00_3 = mma_tf32_m16n8k8(a0_akk, a1_akk, a2_akk, a3_akk, b0_0, b1_0, akk_c00_0, akk_c00_1, akk_c00_2, akk_c00_3)
-            akk_c01_0, akk_c01_1, akk_c01_2, akk_c01_3 = mma_tf32_m16n8k8(a0_akk, a1_akk, a2_akk, a3_akk, b0_1, b1_1, akk_c01_0, akk_c01_1, akk_c01_2, akk_c01_3)
+            # ===== Row r1 (group_id+8, 8-15): element-wise for A and B_tile_1 =====
+            g_r1_0 = sG[(r1, k_offset + col, stage)]
+            g_r1_1 = sG[(r1, k_offset + col + 1, stage)]
+            q_r1_0 = sQK[(r1, k_offset + col, stage * 2)]
+            q_r1_1 = sQK[(r1, k_offset + col + 1, stage * 2)]
+            k_r1_0 = sQK[(r1, k_offset + col, stage * 2 + 1)]
+            k_r1_1 = sQK[(r1, k_offset + col + 1, stage * 2 + 1)]
+            
+            b_gm_r1_0 = g_r1_0 - gn_0
+            b_gm_r1_1 = g_r1_1 - gn_1
+            gq_r1_0 = cute.math.exp2(b_gm_r1_0)
+            gq_r1_1 = cute.math.exp2(b_gm_r1_1)
+            gk_r1_0 = cute.math.exp2(-b_gm_r1_0)
+            gk_r1_1 = cute.math.exp2(-b_gm_r1_1)
+            
+            # A for Aqk (q * gq): a1, a3
+            a_aqk_1 = q_r1_0 * gq_r1_0
+            a_aqk_3 = q_r1_1 * gq_r1_1
+            # A for Akk (k * gq): a1, a3
+            a_akk_1 = k_r1_0 * gq_r1_0
+            a_akk_3 = k_r1_1 * gq_r1_1
+            # B_tile_1 (k * gk, rows 8-15)
+            b0_1 = k_r1_0 * gk_r1_0
+            b1_1 = k_r1_1 * gk_r1_1
+            
+            # ===== MMA directly with computed values (no SMEM write!) =====
+            # Aqk MMA: A[16,8] = q*gq, B[8,8] = k*gk (2 tiles for n=16)
+            aqk_c00_0, aqk_c00_1, aqk_c00_2, aqk_c00_3 = mma_tf32_m16n8k8(a_aqk_0, a_aqk_1, a_aqk_2, a_aqk_3, b0_0, b1_0, aqk_c00_0, aqk_c00_1, aqk_c00_2, aqk_c00_3)
+            aqk_c01_0, aqk_c01_1, aqk_c01_2, aqk_c01_3 = mma_tf32_m16n8k8(a_aqk_0, a_aqk_1, a_aqk_2, a_aqk_3, b0_1, b1_1, aqk_c01_0, aqk_c01_1, aqk_c01_2, aqk_c01_3)
+            
+            # Akk MMA: A[16,8] = k*gq, B[8,8] = k*gk (reuse B tiles!)
+            akk_c00_0, akk_c00_1, akk_c00_2, akk_c00_3 = mma_tf32_m16n8k8(a_akk_0, a_akk_1, a_akk_2, a_akk_3, b0_0, b1_0, akk_c00_0, akk_c00_1, akk_c00_2, akk_c00_3)
+            akk_c01_0, akk_c01_1, akk_c01_2, akk_c01_3 = mma_tf32_m16n8k8(a_akk_0, a_akk_1, a_akk_2, a_akk_3, b0_1, b1_1, akk_c01_0, akk_c01_1, akk_c01_2, akk_c01_3)
         
-        # 6. Reduction: only after processing all k_tiles for this t_sub
-        # Accumulators stay in registers until final k_tile - then store to sAccum for cross-warp reduction
+        # 6. Tree Reduction: only after processing all k_tiles for this t_sub
+        # Uses half SMEM: only need (BC, BC*2, 2) instead of (BC, BC*4, 2)
+        # 
+        # Tree reduction strategy:
+        #   Phase 1: Warps 0,1 write to sAccum
+        #   Phase 2: Warps 2,3 load from sAccum, add to their registers
+        #   Phase 3: Warp 2 writes (warp0+warp2) to sAccum
+        #   Phase 4: Warp 3 loads, adds to get final (warp0+warp1+warp2+warp3)
+        #   Phase 5: Warp 3 writes final to sAccum
+        #   Phase 6: All warps read and write to global
+        
         if k_tile == num_k_tiles - 1:
-            # Store final accumulated results to sAccum (only once per t_sub!)
-            sAccum[(group_id, warp_col_base + tid_in_group * 2, 0)] = aqk_c00_0
-            sAccum[(group_id, warp_col_base + tid_in_group * 2 + 1, 0)] = aqk_c00_1
-            sAccum[(group_id + 8, warp_col_base + tid_in_group * 2, 0)] = aqk_c00_2
-            sAccum[(group_id + 8, warp_col_base + tid_in_group * 2 + 1, 0)] = aqk_c00_3
-            sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2, 0)] = aqk_c01_0
-            sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_1
-            sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2, 0)] = aqk_c01_2
-            sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_3
-            
-            sAccum[(group_id, warp_col_base + tid_in_group * 2, 1)] = akk_c00_0
-            sAccum[(group_id, warp_col_base + tid_in_group * 2 + 1, 1)] = akk_c00_1
-            sAccum[(group_id + 8, warp_col_base + tid_in_group * 2, 1)] = akk_c00_2
-            sAccum[(group_id + 8, warp_col_base + tid_in_group * 2 + 1, 1)] = akk_c00_3
-            sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2, 1)] = akk_c01_0
-            sAccum[(group_id, warp_col_base + 8 + tid_in_group * 2 + 1, 1)] = akk_c01_1
-            sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2, 1)] = akk_c01_2
-            sAccum[(group_id + 8, warp_col_base + 8 + tid_in_group * 2 + 1, 1)] = akk_c01_3
-            
-            cute.arch.barrier()
-            # Each warp handles 4 rows (4 warps * 4 rows = 16 = BC)
-            # Use shuffle to reduce across 4 warps' partial sums
-            #
-            # sAccum layout: (BC=16, BC*NUM_WARPS=64, 2)
-            #   col 0..15 = warp0, col 16..31 = warp1, col 32..47 = warp2, col 48..63 = warp3
-            # Goal: final[row, col] = sum(sAccum[row, col + warp*16]) for warp in 0..3
-            
             t_abs_base = t_start + t_sub * BC
             
+            # ========== Phase 1: Warps 0,1 write to sAccum ==========
+            if warp_id < 2:
+                col_base = warp_id * BC  # warp 0: 0, warp 1: 16
+                sAccum[(group_id, col_base + tid_in_group * 2, 0)] = aqk_c00_0
+                sAccum[(group_id, col_base + tid_in_group * 2 + 1, 0)] = aqk_c00_1
+                sAccum[(group_id + 8, col_base + tid_in_group * 2, 0)] = aqk_c00_2
+                sAccum[(group_id + 8, col_base + tid_in_group * 2 + 1, 0)] = aqk_c00_3
+                sAccum[(group_id, col_base + 8 + tid_in_group * 2, 0)] = aqk_c01_0
+                sAccum[(group_id, col_base + 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_1
+                sAccum[(group_id + 8, col_base + 8 + tid_in_group * 2, 0)] = aqk_c01_2
+                sAccum[(group_id + 8, col_base + 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_3
+                
+                sAccum[(group_id, col_base + tid_in_group * 2, 1)] = akk_c00_0
+                sAccum[(group_id, col_base + tid_in_group * 2 + 1, 1)] = akk_c00_1
+                sAccum[(group_id + 8, col_base + tid_in_group * 2, 1)] = akk_c00_2
+                sAccum[(group_id + 8, col_base + tid_in_group * 2 + 1, 1)] = akk_c00_3
+                sAccum[(group_id, col_base + 8 + tid_in_group * 2, 1)] = akk_c01_0
+                sAccum[(group_id, col_base + 8 + tid_in_group * 2 + 1, 1)] = akk_c01_1
+                sAccum[(group_id + 8, col_base + 8 + tid_in_group * 2, 1)] = akk_c01_2
+                sAccum[(group_id + 8, col_base + 8 + tid_in_group * 2 + 1, 1)] = akk_c01_3
+            
+            cute.arch.barrier()
+            
+            # ========== Phase 2: Warps 2,3 load and add to registers ==========
+            # Warp 2 loads warp 0's data (cols 0-15), warp 3 loads warp 1's data (cols 16-31)
+            if warp_id >= 2:
+                partner_col_base = (warp_id - 2) * BC  # warp 2: 0, warp 3: 16
+                aqk_c00_0 = aqk_c00_0 + sAccum[(group_id, partner_col_base + tid_in_group * 2, 0)]
+                aqk_c00_1 = aqk_c00_1 + sAccum[(group_id, partner_col_base + tid_in_group * 2 + 1, 0)]
+                aqk_c00_2 = aqk_c00_2 + sAccum[(group_id + 8, partner_col_base + tid_in_group * 2, 0)]
+                aqk_c00_3 = aqk_c00_3 + sAccum[(group_id + 8, partner_col_base + tid_in_group * 2 + 1, 0)]
+                aqk_c01_0 = aqk_c01_0 + sAccum[(group_id, partner_col_base + 8 + tid_in_group * 2, 0)]
+                aqk_c01_1 = aqk_c01_1 + sAccum[(group_id, partner_col_base + 8 + tid_in_group * 2 + 1, 0)]
+                aqk_c01_2 = aqk_c01_2 + sAccum[(group_id + 8, partner_col_base + 8 + tid_in_group * 2, 0)]
+                aqk_c01_3 = aqk_c01_3 + sAccum[(group_id + 8, partner_col_base + 8 + tid_in_group * 2 + 1, 0)]
+                
+                akk_c00_0 = akk_c00_0 + sAccum[(group_id, partner_col_base + tid_in_group * 2, 1)]
+                akk_c00_1 = akk_c00_1 + sAccum[(group_id, partner_col_base + tid_in_group * 2 + 1, 1)]
+                akk_c00_2 = akk_c00_2 + sAccum[(group_id + 8, partner_col_base + tid_in_group * 2, 1)]
+                akk_c00_3 = akk_c00_3 + sAccum[(group_id + 8, partner_col_base + tid_in_group * 2 + 1, 1)]
+                akk_c01_0 = akk_c01_0 + sAccum[(group_id, partner_col_base + 8 + tid_in_group * 2, 1)]
+                akk_c01_1 = akk_c01_1 + sAccum[(group_id, partner_col_base + 8 + tid_in_group * 2 + 1, 1)]
+                akk_c01_2 = akk_c01_2 + sAccum[(group_id + 8, partner_col_base + 8 + tid_in_group * 2, 1)]
+                akk_c01_3 = akk_c01_3 + sAccum[(group_id + 8, partner_col_base + 8 + tid_in_group * 2 + 1, 1)]
+            
+            cute.arch.barrier()
+            
+            # ========== Phase 3: Warp 2 writes (warp0+warp2) to sAccum cols 0-15 ==========
+            if warp_id == 2:
+                sAccum[(group_id, tid_in_group * 2, 0)] = aqk_c00_0
+                sAccum[(group_id, tid_in_group * 2 + 1, 0)] = aqk_c00_1
+                sAccum[(group_id + 8, tid_in_group * 2, 0)] = aqk_c00_2
+                sAccum[(group_id + 8, tid_in_group * 2 + 1, 0)] = aqk_c00_3
+                sAccum[(group_id, 8 + tid_in_group * 2, 0)] = aqk_c01_0
+                sAccum[(group_id, 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_1
+                sAccum[(group_id + 8, 8 + tid_in_group * 2, 0)] = aqk_c01_2
+                sAccum[(group_id + 8, 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_3
+                
+                sAccum[(group_id, tid_in_group * 2, 1)] = akk_c00_0
+                sAccum[(group_id, tid_in_group * 2 + 1, 1)] = akk_c00_1
+                sAccum[(group_id + 8, tid_in_group * 2, 1)] = akk_c00_2
+                sAccum[(group_id + 8, tid_in_group * 2 + 1, 1)] = akk_c00_3
+                sAccum[(group_id, 8 + tid_in_group * 2, 1)] = akk_c01_0
+                sAccum[(group_id, 8 + tid_in_group * 2 + 1, 1)] = akk_c01_1
+                sAccum[(group_id + 8, 8 + tid_in_group * 2, 1)] = akk_c01_2
+                sAccum[(group_id + 8, 8 + tid_in_group * 2 + 1, 1)] = akk_c01_3
+            
+            cute.arch.barrier()
+            
+            # ========== Phase 4: Warp 3 loads (warp0+warp2) and adds to get final ==========
+            if warp_id == 3:
+                aqk_c00_0 = aqk_c00_0 + sAccum[(group_id, tid_in_group * 2, 0)]
+                aqk_c00_1 = aqk_c00_1 + sAccum[(group_id, tid_in_group * 2 + 1, 0)]
+                aqk_c00_2 = aqk_c00_2 + sAccum[(group_id + 8, tid_in_group * 2, 0)]
+                aqk_c00_3 = aqk_c00_3 + sAccum[(group_id + 8, tid_in_group * 2 + 1, 0)]
+                aqk_c01_0 = aqk_c01_0 + sAccum[(group_id, 8 + tid_in_group * 2, 0)]
+                aqk_c01_1 = aqk_c01_1 + sAccum[(group_id, 8 + tid_in_group * 2 + 1, 0)]
+                aqk_c01_2 = aqk_c01_2 + sAccum[(group_id + 8, 8 + tid_in_group * 2, 0)]
+                aqk_c01_3 = aqk_c01_3 + sAccum[(group_id + 8, 8 + tid_in_group * 2 + 1, 0)]
+                
+                akk_c00_0 = akk_c00_0 + sAccum[(group_id, tid_in_group * 2, 1)]
+                akk_c00_1 = akk_c00_1 + sAccum[(group_id, tid_in_group * 2 + 1, 1)]
+                akk_c00_2 = akk_c00_2 + sAccum[(group_id + 8, tid_in_group * 2, 1)]
+                akk_c00_3 = akk_c00_3 + sAccum[(group_id + 8, tid_in_group * 2 + 1, 1)]
+                akk_c01_0 = akk_c01_0 + sAccum[(group_id, 8 + tid_in_group * 2, 1)]
+                akk_c01_1 = akk_c01_1 + sAccum[(group_id, 8 + tid_in_group * 2 + 1, 1)]
+                akk_c01_2 = akk_c01_2 + sAccum[(group_id + 8, 8 + tid_in_group * 2, 1)]
+                akk_c01_3 = akk_c01_3 + sAccum[(group_id + 8, 8 + tid_in_group * 2 + 1, 1)]
+            
+            cute.arch.barrier()
+            
+            # ========== Phase 5: Warp 3 writes final result to sAccum cols 0-15 ==========
+            if warp_id == 3:
+                sAccum[(group_id, tid_in_group * 2, 0)] = aqk_c00_0
+                sAccum[(group_id, tid_in_group * 2 + 1, 0)] = aqk_c00_1
+                sAccum[(group_id + 8, tid_in_group * 2, 0)] = aqk_c00_2
+                sAccum[(group_id + 8, tid_in_group * 2 + 1, 0)] = aqk_c00_3
+                sAccum[(group_id, 8 + tid_in_group * 2, 0)] = aqk_c01_0
+                sAccum[(group_id, 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_1
+                sAccum[(group_id + 8, 8 + tid_in_group * 2, 0)] = aqk_c01_2
+                sAccum[(group_id + 8, 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_3
+                
+                sAccum[(group_id, tid_in_group * 2, 1)] = akk_c00_0
+                sAccum[(group_id, tid_in_group * 2 + 1, 1)] = akk_c00_1
+                sAccum[(group_id + 8, tid_in_group * 2, 1)] = akk_c00_2
+                sAccum[(group_id + 8, tid_in_group * 2 + 1, 1)] = akk_c00_3
+                sAccum[(group_id, 8 + tid_in_group * 2, 1)] = akk_c01_0
+                sAccum[(group_id, 8 + tid_in_group * 2 + 1, 1)] = akk_c01_1
+                sAccum[(group_id + 8, 8 + tid_in_group * 2, 1)] = akk_c01_2
+                sAccum[(group_id + 8, 8 + tid_in_group * 2 + 1, 1)] = akk_c01_3
+            
+            cute.arch.barrier()
+            
+            # ========== Phase 6: All warps read final and write to global ==========
+            # Each warp handles 4 rows (4 warps * 4 rows = 16 = BC)
+            # Final result is now in sAccum[0:16, 0:16, :]
             for local_row in cutlass.range_constexpr(4):
                 row = warp_id * 4 + local_row
                 
-                # 32 threads read 64 elements (2 per thread, stride 32)
-                # Thread i reads col i and col i+32 (consecutive access, no bank conflict)
-                col_a = lane_id        # 0..31
-                col_b = lane_id + 32   # 32..63
-                
-                # Read Aqk and Akk partial sums
-                val_a_aqk = sAccum[(row, col_a, 0)]
-                val_b_aqk = sAccum[(row, col_b, 0)]
-                val_a_akk = sAccum[(row, col_a, 1)]
-                val_b_akk = sAccum[(row, col_b, 1)]
-                
-                # Step 1: Add elements 32 apart
-                # Thread 0..15 now has: warp0[i] + warp2[i]
-                # Thread 16..31 now has: warp1[i-16] + warp3[i-16]
-                sum_aqk = val_a_aqk + val_b_aqk
-                sum_akk = val_a_akk + val_b_akk
-                
-                # Step 2: shfl_xor(16) exchanges between thread i and thread i^16
-                # Thread 0 <-> Thread 16, Thread 1 <-> Thread 17, etc.
-                partner_aqk = cute.arch.shuffle_sync_bfly(sum_aqk, offset=16, mask=-1, mask_and_clamp=31)
-                partner_akk = cute.arch.shuffle_sync_bfly(sum_akk, offset=16, mask=-1, mask_and_clamp=31)
-                
-                # Step 3: Final reduction (all 4 warps summed)
-                final_aqk = sum_aqk + partner_aqk
-                final_akk = sum_akk + partner_akk
-                
-                # Step 4: First 16 threads apply mask, scale/beta, and write back to global
+                # Only 16 threads per warp write (lane 0-15)
                 if lane_id < 16:
                     col = lane_id
+                    
+                    # Read final reduced values from sAccum
+                    final_aqk = sAccum[(row, col, 0)]
+                    final_akk = sAccum[(row, col, 1)]
                     
                     # Initialize outputs before control flow (CuTe DSL requirement)
                     val_aqk_out = cutlass.Float32(0.0)
@@ -645,27 +667,20 @@ def run_kda_Akk(
     # q and k share smem with interleaved stages: (BC, BK, NUM_STAGES * 2)
     # Interleaved layout: [q0][k0][q1][k1] so q and k for same stage are adjacent
     # This allows reusing q+k area (2 consecutive float16 stages) as one float32 stage
+    # Add 8-col padding to avoid bank conflicts (row stride 64 -> 72)
+    QK_ROW_STRIDE = BK + 8  # 72
     qk_smem_layout = cute.make_layout(
         (BC, BK, NUM_STAGES * 2),
-        stride=(BK, 1, BC * BK)
+        stride=(QK_ROW_STRIDE, 1, BC * QK_ROW_STRIDE)
     )
     
-    # Float32 smem for r_qgq and r_kgq (both stored, allows fused MMA loop)
-    # (BC, BK, 2) = (16, 64, 2) - slot 0 for r_qgq, slot 1 for r_kgq
-    # Add 8 columns padding to reduce bank conflict: row_stride = 64 + 8 = 72, 72 % 32 = 8
-    QK_F32_ROW_STRIDE = BK + 8  # 72
-    qk_smem_layout_f32 = cute.make_layout(
-        (BC, BK, 2),
-        stride=(QK_F32_ROW_STRIDE, 1, BC * QK_F32_ROW_STRIDE)
-    )
-    
-    # accum: (BC, BC * NUM_WARPS, 2) for Aqk (slot 0) and Akk (slot 1)
-    # Row-major with slot as outermost dimension (two separate stages)
+    # accum: (BC, BC * 2, 2) for Aqk (slot 0) and Akk (slot 1)
+    # With tree reduction, only need space for 2 warps (half of before!)
     # Add 8 floats padding per row to reduce bank conflict
-    # row_stride = 64 + 8 = 72, 72 % 32 = 8 → reduces to 2-way conflict
-    ACCUM_ROW_STRIDE = BC * NUM_WARPS + 8  # 72 (col_count + padding)
+    # row_stride = 32 + 8 = 40, 40 % 32 = 8 → reduces to 4-way conflict
+    ACCUM_ROW_STRIDE = BC * 2 + 8  # 40 (col_count + padding)
     accum_smem_layout = cute.make_layout(
-        (BC, BC * NUM_WARPS, 2),
+        (BC, BC * 2, 2),
         stride=(ACCUM_ROW_STRIDE, 1, BC * ACCUM_ROW_STRIDE)
     )
 
@@ -675,17 +690,15 @@ def run_kda_Akk(
         stride=(1,)
     )
     
-    # SMEM size calculation
+    # SMEM size calculation (sQK_f32 removed after fused element-wise + MMA optimization)
     # g: 16 * 72 * 2 * 4 bytes = 9216 bytes (with 8-col padding)
-    # qk (fp16): 16 * 64 * 4 * 2 bytes = 8192 bytes
-    # qk_f32: 16 * 72 * 2 * 4 bytes = 9216 bytes (2 slots: r_qgq + r_kgq, with 8-col padding)
-    # accum: with padding, two separate stages
-    #        max_offset = (BC-1)*72 + (64-1)*1 + 1*1152 + 1 = 2296 floats
+    # qk (fp16): 16 * 72 * 4 * 2 bytes = 9216 bytes (with 8-col padding)
+    # accum: with tree reduction, only 2 warps' worth of space needed
+    #        (BC, BC*2, 2) with padding: max_offset = (BC-1)*40 + (32-1)*1 + 1*40*BC + 1
     # beta: BT * 2 bytes
-    accum_max_offset = (BC - 1) * ACCUM_ROW_STRIDE + (BC * NUM_WARPS - 1) + BC * ACCUM_ROW_STRIDE + 1
+    accum_max_offset = (BC - 1) * ACCUM_ROW_STRIDE + (BC * 2 - 1) + BC * ACCUM_ROW_STRIDE + 1
     smem_bytes = (4 * BC * G_ROW_STRIDE * NUM_STAGES +  # sG (with 8-col padding)
-                  2 * BC * BK * NUM_STAGES * 2 +        # sQK (fp16)
-                  4 * BC * QK_F32_ROW_STRIDE * 2 +      # sQK_f32 (fp32, 2 slots, with 8-col padding)
+                  2 * BC * QK_ROW_STRIDE * NUM_STAGES * 2 +  # sQK (fp16, with 8-col padding)
                   4 * accum_max_offset +                # sAccum (with padding)
                   2 * BT +                               # sBeta
                   128)                                   # alignment
@@ -705,7 +718,6 @@ def run_kda_Akk(
         Aqk_tensor,
         g_smem_layout,
         qk_smem_layout,
-        qk_smem_layout_f32,
         accum_smem_layout,
         beta_smem_layout,
         BT,
