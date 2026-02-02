@@ -12,7 +12,7 @@
 # ---- Profiling / traces (repo-local) ----
 **/profiler_traces/
 **/nsys_traces/
-**/ncu_reports/
+**/ncu/
 
 # ---- Python ----
 __pycache__/

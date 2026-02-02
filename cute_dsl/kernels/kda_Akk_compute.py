@@ -116,8 +116,8 @@ def load_B_tf32_from_rowmajor(
     tid_in_group = lane_id % 4
     
     # Load with transposed indices (swap row/col)
-    b0 = cutlass.Float32(sB[tid_in_group, group_id])
-    b1 = cutlass.Float32(sB[tid_in_group + 4, group_id])
+    b0 = cutlass.Float32(sB[group_id, tid_in_group])
+    b1 = cutlass.Float32(sB[group_id, tid_in_group + 4])
     
     return b0, b1
 
@@ -196,19 +196,13 @@ def kda_Akk_kernel(
     smem = cutlass.utils.SmemAllocator()
     sG = smem.allocate_tensor(cutlass.Float32, g_smem_layout, 128)
     
-    # Allocate q/k smem with dual view (fp16 for loading, fp32 for storing r_qgq)
+    # Allocate q/k smem (fp16 for loading q/k from global memory)
     # q+k: (BC, BK, NUM_STAGES * 2) fp16 = (16, 64, 4) * 2 bytes = 8KB
-    # Reused as: (BC, BK, NUM_STAGES) fp32 = (16, 64, 2) * 4 bytes = 8KB
-    QK_SMEM_BYTES = BC * BK * NUM_STAGES * 2 * 2  # 8KB
-    ptr_sQK_raw = smem.allocate(QK_SMEM_BYTES, 128)
+    sQK = smem.allocate_tensor(cutlass.Float16, qk_smem_layout, 128)
     
-    # fp16 view (for loading q/k from global memory)
-    ptr_sQK_fp16 = cute.recast_ptr(ptr_sQK_raw, dtype=cutlass.Float16)
-    sQK = cute.make_tensor(ptr_sQK_fp16, qk_smem_layout)
-    
-    # fp32 view (for storing r_qgq, reusing q+k space)
-    ptr_sQK_f32 = cute.recast_ptr(ptr_sQK_raw, dtype=cutlass.Float32)
-    sQK_f32 = cute.make_tensor(ptr_sQK_f32, qk_smem_layout_f32)
+    # Allocate separate fp32 smem for r_qgq (cannot reuse sQK due to incompatible strides)
+    # (BC, BK, NUM_STAGES) fp32 = (16, 64, 2) * 4 bytes = 8KB
+    sQK_f32 = smem.allocate_tensor(cutlass.Float32, qk_smem_layout_f32, 128)
 
     sAccum = smem.allocate_tensor(cutlass.Float32, accum_smem_layout, 128)
     sBeta = smem.allocate_tensor(cutlass.Float16, beta_smem_layout, 128)
@@ -422,13 +416,14 @@ def kda_Akk_kernel(
         #   2. Then write r_kgq to sQK_f32 and compute Akk
         #   B matrix (r_kgk) is shared for both MMAs
         
-        t_sub = it // num_k_tiles
-        k_tile = it - t_sub * num_k_tiles
         
-        lane_id_mma = tidx % 32
+        t_sub = it // num_k_tiles # sub_idx
+        k_tile = it - t_sub * num_k_tiles # k_tile_idx
+        
+        lane_id_mma = tidx % 32 # lane_id
         k_start = warp_id * 2  # warp 0 -> k=0,1; warp 1 -> k=2,3; etc.
-        group_id = lane_id_mma // 4
-        tid_in_group = lane_id_mma % 4
+        group_id = lane_id_mma // 4 # group_id
+        tid_in_group = lane_id_mma % 4 # tid_in_group
         warp_col_base = warp_id * BC  # warp_id * 16
         
         # ========== Aqk MMA (A = r_qgq, already in sQK_f32) ==========
@@ -455,7 +450,7 @@ def kda_Akk_kernel(
         
         # Aqk MMA loop
         for k_iter in cutlass.range_constexpr(2):
-            k = k_start + k_iter
+            k = k_start + k_iter #  k_start = warp_id * 2 -> k=0,1; warp 1 -> k=2,3; etc.
             
             # Load A tile from sQK_f32 (r_qgq)
             sA_tile = cute.local_tile(sQK_f32[(None, None, stage)], tiler=(16, 8), coord=(0, k))
@@ -587,7 +582,7 @@ def kda_Akk_kernel(
                     sAccum[(row1, col1, 1)] = cutlass.Float32(0.0)
             
             cute.arch.barrier()
-            
+        
             # 7. Apply mask and write back to global memory
             # Aqk: mask m_Aqk = (row >= col), i.e., lower triangular including diagonal
             # Akk: mask m_Akk = (row > col), i.e., strictly lower triangular
@@ -682,11 +677,11 @@ def run_kda_Akk(
         stride=(BK, 1, BC * BK)
     )
     
-    # Float32 view for reusing q+k smem space (for r_qgq)
-    # Each fp32 stage spans 2 fp16 stages (q+k), so stride on 3rd dim is doubled
+    # Float32 smem for r_qgq (separate allocation, not reusing sQK)
+    # (BC, BK, NUM_STAGES) = (16, 64, 2)
     qk_smem_layout_f32 = cute.make_layout(
         (BC, BK, NUM_STAGES),
-        stride=(BK, 1, BC * BK * 2)
+        stride=(BK, 1, BC * BK)
     )
     
     # accum: (BC, BC * NUM_WARPS, 2) for Aqk (slot 0) and Akk (slot 1)
@@ -703,11 +698,13 @@ def run_kda_Akk(
     
     # SMEM size calculation
     # g: 16 * 64 * 2 * 4 bytes = 8192 bytes
-    # qk: 16 * 64 * 4 * 2 bytes = 8192 bytes
+    # qk (fp16): 16 * 64 * 4 * 2 bytes = 8192 bytes
+    # qk_f32: 16 * 64 * 2 * 4 bytes = 8192 bytes (separate allocation)
     # accum: 16 * 64 * 2 * 4 bytes = 8192 bytes (Aqk + Akk)
     # beta: BT * 2 bytes
     smem_bytes = (4 * BC * BK * NUM_STAGES +       # sG
-                  2 * BC * BK * NUM_STAGES * 2 +   # sQK
+                  2 * BC * BK * NUM_STAGES * 2 +   # sQK (fp16)
+                  4 * BC * BK * NUM_STAGES +       # sQK_f32 (fp32, separate)
                   4 * BC * BC * NUM_WARPS * 2 +    # sAccum (2 slots: Aqk, Akk)
                   2 * BT +                          # sBeta
                   128)                              # alignment
