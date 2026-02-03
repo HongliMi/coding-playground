@@ -1056,6 +1056,7 @@ if __name__ == "__main__":
         triton_peak_profiler = triton_bw_profiler / peak_bw * 100.0
     
     # =============== Summary Table ===============
+    print("cpasync KDA Akk")
     print("\n" + "=" * 80)
     print(f"Performance Summary (B={B}, T={seq_len}, H={H}, K={K}, Data={data_mb:.1f}MB, Peak={peak_bw}GB/s)")
     print("=" * 80)

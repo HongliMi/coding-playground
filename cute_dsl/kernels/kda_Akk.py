@@ -337,60 +337,12 @@ if __name__ == "__main__":
     print("  q  [0, :5, 0, :5]:")
     print(q[0, :5, 0, :5].detach().cpu())
     
-    # Benchmark (torch.profiler only)
+    # Benchmark
     print(f"\nBenchmarking: {test_iters} iterations...")
 
     # L2 cache eviction buffer (match benchmark_all.py idea)
     dummy_buffer = torch.empty(int(80 * 1024 * 1024 / 4), dtype=torch.float32, device='cuda')
 
-    if not use_profiler:
-        raise SystemExit("use_profiler=False is not supported (CUDA Events timing removed).")
-
-    print(f"\nProfiling with torch.profiler: {test_iters} iterations...")
-    profiler = torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        record_shapes=True,
-        with_stack=False,
-    )
-
-    with profiler:
-        for i in range(test_iters):
-            _ = dummy_buffer.sum()
-            torch.cuda.synchronize()
-            with torch.profiler.record_function(f"kda_Akk_iter{i}"):
-                compiled(g_tensor, q_tensor, k_tensor, Akk_tensor, Aqk_tensor, stream)
-            torch.cuda.synchronize()
-
-    trace_dir = "profiler_traces"
-    os.makedirs(trace_dir, exist_ok=True)
-    trace_file = os.path.join(trace_dir, "kda_Akk.json")
-    profiler.export_chrome_trace(trace_file)
-    print(f"  ✓ Profiler trace saved to {trace_file}")
-
-    profiler_times_us = []
-    try:
-        with open(trace_file, "r") as f:
-            trace_data = json.load(f)
-        for event in trace_data.get("traceEvents", []):
-            # only kernel events
-            if event.get("cat") != "kernel":
-                continue
-            name = event.get("name", "")
-            dur = event.get("dur", 0)  # microseconds
-            # Only extract CUTLASS kernels, ignore dummy_buffer reductions
-            if dur > 0 and "kernel_cutlass" in name:
-                profiler_times_us.append(dur)
-        if profiler_times_us:
-            print(f"  ✓ Parsed {len(profiler_times_us)} CUTLASS kernel timings from profiler trace")
-        else:
-            print("  ⚠ No CUTLASS kernel timings found in profiler trace")
-    except Exception as e:
-        print(f"  ✗ Failed to parse profiler trace: {e}")
-        profiler_times_us = []
-    
     # Data size (bytes moved by this debug kernel)
     # - Read:  g(fp32) + q(fp16) + k(fp16)  -> full K
     # - Write: Akk(fp32) -> only first BC columns
@@ -399,30 +351,125 @@ if __name__ == "__main__":
     write_bytes = (B * T * H * BC * 4) + (B * T * H * BC * 2)
     data_bytes = read_bytes + write_bytes
     data_mb = data_bytes / 1024 / 1024
-    # Use decimal GB to match "peak bandwidth = 8192" convention
     data_gib = data_bytes / 1000 / 1000 / 1000
     
-    print("\n" + "=" * 50)
-    print(f"✓ Results:")
-    print(f"  Data: {data_mb:.2f} MB")
-    if len(profiler_times_us) > 0:
-        prof = torch.tensor(profiler_times_us, dtype=torch.float64)
-        prof_ms = prof / 1000.0
-        mean_ms = prof_ms.mean().item()
-        min_ms = prof_ms.min().item()
-        bw_gibs = data_gib / (mean_ms / 1000.0)
-        peak_bw = 8192.0
-        peak_pct = bw_gibs / peak_bw * 100.0
-        print(f"  Bytes (read/write/total): {read_bytes} / {write_bytes} / {data_bytes}")
-        print(f"  Profiler Mean: {mean_ms:.4f} ms (kernel_cutlass only)")
-        print(f"  Profiler Min:  {min_ms:.4f} ms (kernel_cutlass only)")
-        print(f"  BW (profiler mean): {bw_gibs:.1f} GB/s")
-        print(f"  Peak% (peak={peak_bw:.0f}): {peak_pct:.2f}%")
-        if len(profiler_times_us) != test_iters:
-            print(f"  Note: kernel_count={len(profiler_times_us)} != test_iters={test_iters} (mean is over kernel events).")
+    # 峰值带宽 (GB/s) - 根据不同 GPU 平台修改
+    # B200: 8000, H100 SXM: 3350, H100 PCIe: 2000, A100 SXM: 2039, A100 PCIe: 1555
+    PEAK_BW_GBS = 7672  # B200
+
+    # =============== CUDA Event Timing ===============
+    print(f"\nCUDA Event Timing: {test_iters} iterations...")
+    
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    cuda_event_times_ms = []
+    for i in range(test_iters):
+        # Evict L2 cache
+        _ = dummy_buffer.sum()
+        torch.cuda.synchronize()
+        
+        start_event.record()
+        compiled(g_tensor, q_tensor, k_tensor, Akk_tensor, Aqk_tensor, stream)
+        end_event.record()
+        
+        torch.cuda.synchronize()
+        elapsed_ms = start_event.elapsed_time(end_event)
+        cuda_event_times_ms.append(elapsed_ms)
+    
+    cuda_event_times = torch.tensor(cuda_event_times_ms, dtype=torch.float64)
+    cuda_event_mean_ms = cuda_event_times.mean().item()
+    cuda_event_min_ms = cuda_event_times.min().item()
+    cuda_event_std_ms = cuda_event_times.std().item()
+    
+    print(f"  ✓ CUDA Event Mean: {cuda_event_mean_ms:.4f} ms")
+    print(f"  ✓ CUDA Event Min:  {cuda_event_min_ms:.4f} ms")
+    print(f"  ✓ CUDA Event Std:  {cuda_event_std_ms:.4f} ms")
+
+    # =============== torch.profiler Timing ===============
+    if use_profiler:
+        print(f"\nProfiling with torch.profiler: {test_iters} iterations...")
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            with_stack=False,
+        )
+
+        with profiler:
+            for i in range(test_iters):
+                _ = dummy_buffer.sum()
+                torch.cuda.synchronize()
+                with torch.profiler.record_function(f"kda_Akk_iter{i}"):
+                    compiled(g_tensor, q_tensor, k_tensor, Akk_tensor, Aqk_tensor, stream)
+                torch.cuda.synchronize()
+
+        trace_dir = "profiler_traces"
+        os.makedirs(trace_dir, exist_ok=True)
+        trace_file = os.path.join(trace_dir, "kda_Akk.json")
+        profiler.export_chrome_trace(trace_file)
+        print(f"  ✓ Profiler trace saved to {trace_file}")
+
+        profiler_times_us = []
+        try:
+            with open(trace_file, "r") as f:
+                trace_data = json.load(f)
+            for event in trace_data.get("traceEvents", []):
+                if event.get("cat") != "kernel":
+                    continue
+                name = event.get("name", "")
+                dur = event.get("dur", 0)
+                if dur > 0 and "kernel_cutlass" in name:
+                    profiler_times_us.append(dur)
+            if profiler_times_us:
+                print(f"  ✓ Parsed {len(profiler_times_us)} CUTLASS kernel timings from profiler trace")
+            else:
+                print("  ⚠ No CUTLASS kernel timings found in profiler trace")
+        except Exception as e:
+            print(f"  ✗ Failed to parse profiler trace: {e}")
+            profiler_times_us = []
     else:
-        print("  ✗ No kernel timings parsed; bandwidth unavailable.")
-    print("=" * 50)
-    print("PASS")
+        profiler_times_us = []
+    
+    # =============== Calculate metrics ===============
+    # CUDA Event metrics
+    cute_bw_cuda = data_gib / (cuda_event_mean_ms / 1000.0)
+    cute_peak_cuda = cute_bw_cuda / PEAK_BW_GBS * 100.0
+    
+    # Profiler metrics
+    cute_profiler_mean_ms = 0.0
+    cute_bw_profiler = 0.0
+    cute_peak_profiler = 0.0
+    if len(profiler_times_us) > 0:
+        cute_profiler_mean_ms = torch.tensor(profiler_times_us, dtype=torch.float64).mean().item() / 1000.0
+        cute_bw_profiler = data_gib / (cute_profiler_mean_ms / 1000.0)
+        cute_peak_profiler = cute_bw_profiler / PEAK_BW_GBS * 100.0
+    
+    # =============== Summary Table ===============
+    print("\n" + "=" * 60)
+    print(f"Performance Summary (B={B}, T={T}, H={H}, K={K})")
+    print(f"Data: {data_mb:.1f} MB, Peak BW: {PEAK_BW_GBS} GB/s")
+    print("=" * 60)
+    print(f"{'Metric':<20} | {'Value':<18}")
+    print("-" * 60)
+    
+    # CUDA Event row
+    print(f"{'CUDA Event (ms)':<20} | {cuda_event_mean_ms:<18.4f}")
+    print(f"{'  → Min (ms)':<20} | {cuda_event_min_ms:<18.4f}")
+    print(f"{'  → Std (ms)':<20} | {cuda_event_std_ms:<18.4f}")
+    print(f"{'  → BW (GB/s)':<20} | {cute_bw_cuda:<18.1f}")
+    print(f"{'  → Peak%':<20} | {cute_peak_cuda:<18.2f}")
+    
+    # Profiler row
+    if cute_profiler_mean_ms > 0:
+        print("-" * 60)
+        print(f"{'Profiler (ms)':<20} | {cute_profiler_mean_ms:<18.4f}")
+        print(f"{'  → BW (GB/s)':<20} | {cute_bw_profiler:<18.1f}")
+        print(f"{'  → Peak%':<20} | {cute_peak_profiler:<18.2f}")
+    
+    print("=" * 60)
+    print("DONE")
     
     del compiled

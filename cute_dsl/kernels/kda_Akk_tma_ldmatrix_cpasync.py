@@ -158,33 +158,33 @@ PEAK_BW_GBS = 7672  # B200
 
 @cute.kernel
 def kda_Akk_kernel(
-    tma_atom_g: cute.CopyAtom,
-    tma_tensor_g: cute.Tensor,   # 5D view: [BC, BK, B*NT, H, num_k_tiles] float32
-    tma_atom_q: cute.CopyAtom,
-    tma_tensor_q: cute.Tensor,   # 5D view: [BC, BK, B*NT, H, num_k_tiles] fp16
-    tma_atom_k: cute.CopyAtom,
-    tma_tensor_k: cute.Tensor,   # 5D view: [BC, BK, B*NT, H, num_k_tiles] fp16
-    g_smem_layout,               # 3D ComposedLayout with swizzle: (BC, BK, NUM_STAGES)
-    qk_smem_layout,              # 3D ComposedLayout with swizzle: (BC, BK, NUM_STAGES * 2)
-    beta_tensor: cute.Tensor,    # (B, T, H) fp16
-    Akk_tensor: cute.Tensor,     # (B, T, H, BC) output
-    Aqk_tensor: cute.Tensor,     # (B, T, H, BT) output
-    accum_smem_layout: cute.Layout, # (BC, BC * 2, 2) for Aqk and Akk
-    beta_smem_layout: cute.Layout, # (BT,)
-    tiled_mma: cute.TiledMma,    # MMA configuration for ldmatrix
-    tiled_copy_Q: cute.TiledCopy, # ldmatrix for Q (16x8)
-    tiled_copy_K: cute.TiledCopy, # ldmatrix for K (8x8)
+    tiled_copy_g: cute.TiledCopy,       # cp.async for G
+    tma_atom_q: cute.CopyAtom,          # TMA for Q
+    tma_tensor_q: cute.Tensor,          # 5D view for Q TMA
+    tma_atom_k: cute.CopyAtom,          # TMA for K
+    tma_tensor_k: cute.Tensor,          # 5D view for K TMA
+    g_tensor: cute.Tensor,              # (B, T, H, K) float32
+    beta_tensor: cute.Tensor,           # (B, T, H) fp16
+    Akk_tensor: cute.Tensor,            # (B, T, H, BC) output
+    Aqk_tensor: cute.Tensor,            # (B, T, H, BT) output
+    g_smem_layout: cute.Layout,         # (BC, BK, NUM_STAGES) with padding, no swizzle
+    qk_smem_layout,                     # ComposedLayout with swizzle: (BC, BK, NUM_STAGES * 2)
+    accum_smem_layout: cute.Layout,     # (BC, BC * 2, 2) for Aqk and Akk
+    beta_smem_layout: cute.Layout,      # (BT,)
+    tiled_mma: cute.TiledMma,           # MMA configuration for ldmatrix
+    tiled_copy_Q: cute.TiledCopy,       # ldmatrix for Q (16x8)
+    tiled_copy_K: cute.TiledCopy,       # ldmatrix for K (8x8)
     BT: cutlass.Constexpr[int],
     num_k_tiles: cutlass.Constexpr[int],
-    seq_len: int,                # sequence length
-    scale: cutlass.Float32,      # scale factor for Aqk
+    seq_len: int,                       # sequence length
+    scale: cutlass.Float32,             # scale factor for Aqk
 ):
     """
-    KDA Akk kernel using TMA for g/q/k loading.
+    KDA Akk kernel using cp.async for G loading, TMA for Q/K loading with ldmatrix for MMA.
     - Each block handles one (batch, chunk, head)
     - The block owns a [BT, K] chunk, tiled by (BC, BK)
       BT=64, BC=16 => 4 tiles along T; K=128, BK=64 => 2 tiles along K; total 8 tiles.
-    - G: TMA load without swizzle -> direct indexing for element-wise
+    - G: cp.async load with 8-col padding -> direct indexing for element-wise
     - Q/K: TMA load with swizzle -> ldmatrix for MMA register loading
     """
     
@@ -196,11 +196,11 @@ def kda_Akk_kernel(
     # =============== Allocate shared memory ===============
     smem = cutlass.utils.SmemAllocator()
     
-    # g: (BC, BK, NUM_STAGES) with swizzle - indexing handles swizzle automatically
-    sG = smem.allocate_tensor(cutlass.Float32, g_smem_layout.outer, 128, swizzle=g_smem_layout.inner)
+    # g: (BC, BK, NUM_STAGES) with 8-col padding - no swizzle
+    sG = smem.allocate_tensor(cutlass.Float32, g_smem_layout, 128)
     
     # qk: (BC, BK, NUM_STAGES * 2) with swizzle, interleaved [q0][k0][q1][k1]
-    # Use ldmatrix for loading to registers
+    # Use TMA for loading, ldmatrix for SMEM->register
     sQK = smem.allocate_tensor(cutlass.Float16, qk_smem_layout.outer, 128, swizzle=qk_smem_layout.inner)
     
     sAccum = smem.allocate_tensor(cutlass.Float32, accum_smem_layout, 128)
@@ -209,12 +209,11 @@ def kda_Akk_kernel(
     # Allocate mbarriers for TMA synchronization (one per stage)
     mbar_ptr = smem.allocate_array(cutlass.Int64, NUM_STAGES)
     
-    # TMA tile size in bytes
-    g_tile_bytes = BC * BK * 4   # float32
+    # TMA tile size in bytes (only Q+K use TMA)
     qk_tile_bytes = BC * BK * 2  # fp16
-    total_tile_bytes = g_tile_bytes + qk_tile_bytes * 2  # g + q + k
+    total_tma_bytes = qk_tile_bytes * 2  # q + k
     
-    # Initialize mbarriers using pointer offset
+    # Initialize mbarriers
     if tidx == 0:
         for stage in range(NUM_STAGES):
             cute.arch.mbarrier_init(mbar_ptr + stage, 1)
@@ -225,15 +224,24 @@ def kda_Akk_kernel(
     t_start = i_t * BT
     t_tile_base = i_t * (BT // BC)  # base tile index in (T/BC) dimension
     
-    # Compute global tile index offset: i_b * (T/BC) + t_tile_base
+    # Compute global tile index offset for TMA: i_b * (T/BC) + t_tile_base
     num_t_tiles_per_batch = seq_len // BC
     g_tile_base = i_b * num_t_tiles_per_batch + t_tile_base
     
-    # Load beta for this chunk: sBeta[0:BT] <- beta[t_start : t_start+BT]
+    # 获取当前 batch 和 head 的数据 slice
+    gG_batch = g_tensor[(i_b, None, i_h, None)]   # (T, K) for G (cpasync)
     gBeta_batch = beta_tensor[(i_b, None, i_h)]   # (T,)
+
+    # Stage beta for this chunk: sBeta[0:BT] <- beta[t_start : t_start+BT]
     if tidx < BT:
         sBeta[tidx] = gBeta_batch[t_start + tidx]
     cute.arch.barrier()
+    
+    # G: 对 T 和 K 维度分 tiles: (BC, BK, T/BC, K/BK) - 4D tensor
+    gG = cute.local_tile(gG_batch, (BC, BK), (None, None))
+    
+    # Get thread-level copy partitions for G (cpasync)
+    thr_copy_g = tiled_copy_g.get_slice(tidx)
     
     # Iterate all tiles in the chunk:
     #   iter -> (t_sub, k_tile)
@@ -241,35 +249,38 @@ def kda_Akk_kernel(
     num_t_tiles = BT // BC
     total_tiles = num_t_tiles * num_k_tiles
 
-    # =============== Prefetch first stages using TMA ===============
-    # IMPORTANT: Only warp 0 executes TMA copies to avoid multiple TMA requests
+    # Get thread slices for ldmatrix (moved outside loop for efficiency)
+    lane_id = tidx % 32
+    thr_mma = tiled_mma.get_slice(lane_id)
+    thr_copy_Q_ld = tiled_copy_Q.get_slice(lane_id)
+    thr_copy_K_ld = tiled_copy_K.get_slice(lane_id)
+
+    # =============== Prefetch first stages ===============
+    # G: cp.async, Q/K: TMA (warp 0 only issues TMA)
     prefetch_count = cutlass.min(NUM_STAGES - 1, total_tiles)
-    if warp_idx == 0:
-        for it in range(prefetch_count):
-            stage = it % NUM_STAGES
-            t_sub = it // num_k_tiles
-            k_tile = it - t_sub * num_k_tiles
-            
-            # Global tile index in the 5D TMA tensor
-            t_tile_idx = g_tile_base + t_sub
-            
-            # Expect bytes for this stage's mbarrier (using pointer offset)
+    for it in range(prefetch_count):
+        stage = it % NUM_STAGES
+        t_sub = it // num_k_tiles
+        k_tile = it - t_sub * num_k_tiles
+        t_tile_idx = t_tile_base + t_sub
+        t_tile_idx_tma = g_tile_base + t_sub  # for TMA 5D view
+
+        # Load G tile via cp.async (all threads)
+        gG_tile = gG[(None, None, t_tile_idx, k_tile)]
+        sG_stage = sG[(None, None, stage)]
+        thr_gG = thr_copy_g.partition_S(gG_tile)
+        thr_sG = thr_copy_g.partition_D(sG_stage)
+        cute.copy(tiled_copy_g, thr_gG, thr_sG)
+        cute.arch.cp_async_commit_group()
+
+        # Load Q/K tiles via TMA (warp 0 only)
+        if warp_idx == 0:
+            # Expect bytes for this stage's mbarrier
             if tidx == 0:
-                cute.arch.mbarrier_expect_tx(mbar_ptr + stage, total_tile_bytes)
+                cute.arch.mbarrier_expect_tx(mbar_ptr + stage, total_tma_bytes)
             
-            # TMA load g: global -> sG[(None, None, stage)]
-            gG_src = cute.local_tile(tma_tensor_g, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx, i_h, k_tile))
-            gG_src_2d = gG_src[(None, None, 0, 0, 0)]
-            sG_stage = sG[(None, None, stage)]
-            tma_sG, tma_gG = cpasync.tma_partition(
-                tma_atom_g, 0, cute.make_layout(1),
-                cute.group_modes(sG_stage, 0, 2),
-                cute.group_modes(gG_src_2d, 0, 2),
-            )
-            cute.copy(tma_atom_g, tma_gG, tma_sG, tma_bar_ptr=mbar_ptr + stage)
-            
-            # TMA load q: global -> sQK[(None, None, stage * 2)]
-            gQ_src = cute.local_tile(tma_tensor_q, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx, i_h, k_tile))
+            # TMA load Q: global -> sQK[(None, None, stage * 2)]
+            gQ_src = cute.local_tile(tma_tensor_q, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx_tma, i_h, k_tile))
             gQ_src_2d = gQ_src[(None, None, 0, 0, 0)]
             sQ_stage = sQK[(None, None, stage * 2)]
             tma_sQ, tma_gQ = cpasync.tma_partition(
@@ -279,8 +290,8 @@ def kda_Akk_kernel(
             )
             cute.copy(tma_atom_q, tma_gQ, tma_sQ, tma_bar_ptr=mbar_ptr + stage)
             
-            # TMA load k: global -> sQK[(None, None, stage * 2 + 1)]
-            gK_src = cute.local_tile(tma_tensor_k, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx, i_h, k_tile))
+            # TMA load K: global -> sQK[(None, None, stage * 2 + 1)]
+            gK_src = cute.local_tile(tma_tensor_k, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx_tma, i_h, k_tile))
             gK_src_2d = gK_src[(None, None, 0, 0, 0)]
             sK_stage = sQK[(None, None, stage * 2 + 1)]
             tma_sK, tma_gK = cpasync.tma_partition(
@@ -315,61 +326,63 @@ def kda_Akk_kernel(
         stage = it % NUM_STAGES
         phase = it // NUM_STAGES % 2
 
-        # Arrive at current stage mbarrier (thread 0 only)
+        # Wait for G (cp.async)
+        cute.arch.cp_async_wait_group(NUM_STAGES - 2)
+        
+        # Arrive at mbarrier for TMA
         if tidx == 0:
             cute.arch.mbarrier_arrive(mbar_ptr + stage)
         
-        # Wait for current stage TMA data to be ready using mbarrier
+        # Wait for Q/K (TMA via mbarrier)
         cute.arch.mbarrier_wait(mbar_ptr + stage, phase)
 
-        # Issue next TMA loads (overlapped with compute)
-        # IMPORTANT: Only warp 0 executes TMA copies
+        # Issue next loads (overlapped with compute)
         next_it = it + prefetch_count
-        if warp_idx == 0 and next_it < total_tiles:
+        if next_it < total_tiles:
             next_stage = next_it % NUM_STAGES
             t_sub_n = next_it // num_k_tiles
             k_tile_n = next_it - t_sub_n * num_k_tiles
-            t_tile_idx_n = g_tile_base + t_sub_n
-            
-            # Expect bytes for next stage's mbarrier (using pointer offset)
-            if tidx == 0:
-                cute.arch.mbarrier_expect_tx(mbar_ptr + next_stage, total_tile_bytes)
-            
-            # TMA load next g
-            gG_src_n = cute.local_tile(tma_tensor_g, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx_n, i_h, k_tile_n))
-            gG_src_2d_n = gG_src_n[(None, None, 0, 0, 0)]
+            t_tile_idx_n = t_tile_base + t_sub_n
+            t_tile_idx_tma_n = g_tile_base + t_sub_n  # for TMA
+
+            # Load next G tile via cp.async (all threads)
+            gG_next = gG[(None, None, t_tile_idx_n, k_tile_n)]
             sG_next = sG[(None, None, next_stage)]
-            tma_sG_n, tma_gG_n = cpasync.tma_partition(
-                tma_atom_g, 0, cute.make_layout(1),
-                cute.group_modes(sG_next, 0, 2),
-                cute.group_modes(gG_src_2d_n, 0, 2),
-            )
-            cute.copy(tma_atom_g, tma_gG_n, tma_sG_n, tma_bar_ptr=mbar_ptr + next_stage)
-            
-            # TMA load next q
-            gQ_src_n = cute.local_tile(tma_tensor_q, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx_n, i_h, k_tile_n))
-            gQ_src_2d_n = gQ_src_n[(None, None, 0, 0, 0)]
-            sQ_next = sQK[(None, None, next_stage * 2)]
-            tma_sQ_n, tma_gQ_n = cpasync.tma_partition(
-                tma_atom_q, 0, cute.make_layout(1),
-                cute.group_modes(sQ_next, 0, 2),
-                cute.group_modes(gQ_src_2d_n, 0, 2),
-            )
-            cute.copy(tma_atom_q, tma_gQ_n, tma_sQ_n, tma_bar_ptr=mbar_ptr + next_stage)
-            
-            # TMA load next k
-            gK_src_n = cute.local_tile(tma_tensor_k, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx_n, i_h, k_tile_n))
-            gK_src_2d_n = gK_src_n[(None, None, 0, 0, 0)]
-            sK_next = sQK[(None, None, next_stage * 2 + 1)]
-            tma_sK_n, tma_gK_n = cpasync.tma_partition(
-                tma_atom_k, 0, cute.make_layout(1),
-                cute.group_modes(sK_next, 0, 2),
-                cute.group_modes(gK_src_2d_n, 0, 2),
-            )
-            cute.copy(tma_atom_k, tma_gK_n, tma_sK_n, tma_bar_ptr=mbar_ptr + next_stage)
+            thr_gG = thr_copy_g.partition_S(gG_next)
+            thr_sG = thr_copy_g.partition_D(sG_next)
+            cute.copy(tiled_copy_g, thr_gG, thr_sG)
+            cute.arch.cp_async_commit_group()
+
+            # Load next Q/K tiles via TMA (warp 0 only)
+            if warp_idx == 0:
+                # Expect bytes for next stage's mbarrier
+                if tidx == 0:
+                    cute.arch.mbarrier_expect_tx(mbar_ptr + next_stage, total_tma_bytes)
+                
+                # TMA load next Q
+                gQ_src_n = cute.local_tile(tma_tensor_q, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx_tma_n, i_h, k_tile_n))
+                gQ_src_2d_n = gQ_src_n[(None, None, 0, 0, 0)]
+                sQ_next = sQK[(None, None, next_stage * 2)]
+                tma_sQ_n, tma_gQ_n = cpasync.tma_partition(
+                    tma_atom_q, 0, cute.make_layout(1),
+                    cute.group_modes(sQ_next, 0, 2),
+                    cute.group_modes(gQ_src_2d_n, 0, 2),
+                )
+                cute.copy(tma_atom_q, tma_gQ_n, tma_sQ_n, tma_bar_ptr=mbar_ptr + next_stage)
+                
+                # TMA load next K
+                gK_src_n = cute.local_tile(tma_tensor_k, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx_tma_n, i_h, k_tile_n))
+                gK_src_2d_n = gK_src_n[(None, None, 0, 0, 0)]
+                sK_next = sQK[(None, None, next_stage * 2 + 1)]
+                tma_sK_n, tma_gK_n = cpasync.tma_partition(
+                    tma_atom_k, 0, cute.make_layout(1),
+                    cute.group_modes(sK_next, 0, 2),
+                    cute.group_modes(gK_src_2d_n, 0, 2),
+                )
+                cute.copy(tma_atom_k, tma_gK_n, tma_sK_n, tma_bar_ptr=mbar_ptr + next_stage)
 
         # =============== Fused Element-wise + MMA using ldmatrix ===============
-        # Strategy: Use ldmatrix to load Q/K from swizzled SMEM, load G directly (no swizzle),
+        # Strategy: Use ldmatrix to load Q/K from SMEM (with padding), load G directly,
         # compute element-wise in registers, then do MMA.
         #
         # MMA m16n8k8 layout:
@@ -393,15 +406,9 @@ def kda_Akk_kernel(
         
         # Thread/warp mapping for MMA
         warp_id = tidx // 32
-        lane_id = tidx % 32
         group_id = lane_id // 4      # 0-7, determines rows (group_id and group_id+8)
         tid_in_group = lane_id % 4   # 0-3, determines cols within 8-col tile (tid*2 and tid*2+1)
         k_start = warp_id * 2        # warp 0 -> k=0,1; warp 1 -> k=2,3; etc.
-        
-        # Get thread slices for ldmatrix
-        thr_mma = tiled_mma.get_slice(lane_id)
-        thr_copy_Q = tiled_copy_Q.get_slice(lane_id)
-        thr_copy_K = tiled_copy_K.get_slice(lane_id)
         
         # ========== Reset accumulators at k_tile == 0 (new t_sub) ==========
         if k_tile == 0:
@@ -442,27 +449,27 @@ def kda_Akk_kernel(
             sQ_tile = cute.local_tile(sQ_stage, tiler=(16, 8), coord=(0, k))
             tCsQ = thr_mma.partition_A(sQ_tile)
             tCrQ = tiled_mma.make_fragment_A(tCsQ)
-            tCsQ_view = thr_copy_Q.partition_S(sQ_tile)
-            tCrQ_view = thr_copy_Q.retile(tCrQ)
+            tCsQ_view = thr_copy_Q_ld.partition_S(sQ_tile)
+            tCrQ_view = thr_copy_Q_ld.retile(tCrQ)
             cute.copy(tiled_copy_Q, tCsQ_view, tCrQ_view)
             
             # ===== Load K tile 0 (rows 0-7, 8x8) via ldmatrix =====
             sK_tile_n0 = cute.local_tile(sK_stage, tiler=(8, 8), coord=(0, k))
             tCsK_n0 = thr_mma.partition_B(sK_tile_n0)
             tCrK_n0 = tiled_mma.make_fragment_B(tCsK_n0)
-            tCsK_n0_view = thr_copy_K.partition_S(sK_tile_n0)
-            tCrK_n0_view = thr_copy_K.retile(tCrK_n0)
+            tCsK_n0_view = thr_copy_K_ld.partition_S(sK_tile_n0)
+            tCrK_n0_view = thr_copy_K_ld.retile(tCrK_n0)
             cute.copy(tiled_copy_K, tCsK_n0_view, tCrK_n0_view)
             
             # ===== Load K tile 1 (rows 8-15, 8x8) via ldmatrix =====
             sK_tile_n1 = cute.local_tile(sK_stage, tiler=(8, 8), coord=(1, k))
             tCsK_n1 = thr_mma.partition_B(sK_tile_n1)
             tCrK_n1 = tiled_mma.make_fragment_B(tCsK_n1)
-            tCsK_n1_view = thr_copy_K.partition_S(sK_tile_n1)
-            tCrK_n1_view = thr_copy_K.retile(tCrK_n1)
+            tCsK_n1_view = thr_copy_K_ld.partition_S(sK_tile_n1)
+            tCrK_n1_view = thr_copy_K_ld.retile(tCrK_n1)
             cute.copy(tiled_copy_K, tCsK_n1_view, tCrK_n1_view)
             
-            # ===== Load G values directly (no swizzle) =====
+            # ===== Load G values directly (no swizzle, with padding) =====
             gn_0 = sG_stage[(gn_row, k_offset + col)]
             gn_1 = sG_stage[(gn_row, k_offset + col + 1)]
             g_r0_0 = sG_stage[(r0, k_offset + col)]
@@ -710,7 +717,24 @@ def run_kda_Akk(
     num_k_tiles = cute.ceil_div(K, BK)
     NT = cute.ceil_div(seq_len, BT)  # number of chunks
     
-    # =============== Create TMA for g/q/k ===============
+    # =============== Create tiled copy for g (float32) ===============
+    # 128 bits = 4 floats per copy
+    # Thread layout: (8, 16) -> 128 threads
+    # Val layout: (1, 4) -> 4 floats per thread
+    # Coverage per iteration: 8 rows x 64 cols, need 2 iterations for 16 rows
+    copy_atom_g = cute.make_copy_atom(
+        cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+        cutlass.Float32,
+        num_bits_per_copy=128
+    )
+    thread_layout_g = cute.make_layout(
+        (8, 16),       # 8 rows x 16 threads per row
+        stride=(16, 1)
+    )
+    val_layout_g = cute.make_layout((1, 4))  # 4 floats per thread
+    tiled_copy_g = cute.make_tiled_copy_tv(copy_atom_g, thread_layout_g, val_layout_g)
+    
+    # =============== Create TMA for Q/K ===============
     # Original shape: (B, T, H, K), stride: (T*H*K, H*K, K, 1)
     # 5D view: [BC, BK, B*(T/BC), H, K/BK] = [16, 64, B*seq_len/16, H, 2]
     # This allows TMA to load a (BC, BK) tile per operation
@@ -730,37 +754,30 @@ def run_kda_Akk(
     s_h = K
     s_k_tile = BK
     
-    gqk_view_layout = cute.make_layout(
+    qk_view_layout = cute.make_layout(
         (BC, BK, num_t_tiles_total, H, num_k_tiles),
         stride=(s_bc, s_bk, s_t_tile, s_h, s_k_tile)
     )
     
-    # Create view tensors for g, q and k
-    g_view = cute.make_tensor(g_tensor.iterator, gqk_view_layout)
-    q_view = cute.make_tensor(q_tensor.iterator, gqk_view_layout)
-    k_view = cute.make_tensor(k_tensor.iterator, gqk_view_layout)
+    # Create view tensors for q and k
+    q_view = cute.make_tensor(q_tensor.iterator, qk_view_layout)
+    k_view = cute.make_tensor(k_tensor.iterator, qk_view_layout)
     
     # =============== SMEM layouts ===============
-    # G: Swizzled layout for TMA (same pattern as Q/K but for float32)
-    smem_atom_g = tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Float32)
-    g_smem_layout_2d = cute.tile_to_shape(smem_atom_g, (BC, BK), order=(0, 1))
-    g_smem_layout = cute.tile_to_shape(smem_atom_g, (BC, BK, NUM_STAGES), order=(0, 1, 2))
+    # G: 8-col padding, no swizzle (for element-wise access)
+    G_ROW_STRIDE = BK + 8  # 72
+    g_smem_layout = cute.make_layout(
+        (BC, BK, NUM_STAGES),
+        stride=(G_ROW_STRIDE, 1, BC * G_ROW_STRIDE)
+    )
     
     # Q/K: Swizzled layout for TMA + ldmatrix
     smem_atom_qk = tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Float16)
     qk_smem_layout_2d = cute.tile_to_shape(smem_atom_qk, (BC, BK), order=(0, 1))
-    
-    # qk: (BC, BK, NUM_STAGES * 2) fp16, interleaved [q0][k0][q1][k1]
     qk_smem_layout = cute.tile_to_shape(smem_atom_qk, (BC, BK, NUM_STAGES * 2), order=(0, 1, 2))
     
-    # TMA load atoms for g, q and k
+    # TMA load atoms for q and k
     tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cpasync.CtaGroup.ONE)
-    
-    # G: TMA with swizzle
-    tma_atom_g, tma_tensor_g = cpasync.make_tiled_tma_atom(
-        tma_load_op, g_view, g_smem_layout_2d, cute.product_each(g_smem_layout_2d.shape), num_multicast=1
-    )
-    # Q/K: TMA with swizzle
     tma_atom_q, tma_tensor_q = cpasync.make_tiled_tma_atom(
         tma_load_op, q_view, qk_smem_layout_2d, cute.product_each(qk_smem_layout_2d.shape), num_multicast=1
     )
@@ -781,10 +798,7 @@ def run_kda_Akk(
     atom_copy_K = cute.make_copy_atom(cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 1), cutlass.Float16)
     tiled_copy_K = cute.make_tiled_copy_B(atom_copy_K, tiled_mma)
     
-    # =============== SMEM layouts ===============
-    # g/q/k use swizzle layouts defined above (g_smem_layout_swizzle, qk_smem_layout_swizzle)
-    # Only need to define accum and beta layouts here
-    
+    # =============== Accum and beta SMEM layouts ===============
     # accum: (BC, BC * 2, 2) for Aqk (slot 0) and Akk (slot 1)
     # With tree reduction, only need space for 2 warps
     # Add 8-col padding to avoid bank conflict
@@ -801,34 +815,34 @@ def run_kda_Akk(
     )
     
     # SMEM size calculation
-    # g: 16 * 64 * NUM_STAGES * 4 bytes (with swizzle)
-    # qk (fp16): 16 * 64 * (NUM_STAGES * 2) * 2 bytes for q and k interleaved (with swizzle)
+    # g: 16 * 72 * NUM_STAGES * 4 bytes (with 8-col padding, no swizzle)
+    # qk (fp16): 16 * 64 * (NUM_STAGES * 2) * 2 bytes (with swizzle)
     # accum: (BC, BC*2+8, 2) = 16 * 40 * 2 * 4 bytes (8-col padding)
     # beta: BT * 2 bytes
     # mbarrier: 8 bytes per barrier * NUM_STAGES
-    smem_bytes = (4 * BC * BK * NUM_STAGES +                     # sG (float32, swizzled)
+    smem_bytes = (4 * BC * G_ROW_STRIDE * NUM_STAGES +           # sG (float32, with padding)
                   2 * BC * BK * NUM_STAGES * 2 +                 # sQK (fp16, swizzled, interleaved q/k)
                   4 * BC * (BC * 2 + ACCUM_PAD) * 2 +            # sAccum (8-col padding)
                   2 * BT +                                        # sBeta
                   8 * NUM_STAGES +                                # mbarriers
                   256)                                            # alignment
     
-    print(f"KDA Akk: B={B}, T={seq_len}, H={H}, K={K}")
+    print(f"KDA Akk (G:cpasync + QK:TMA + ldmatrix): B={B}, T={seq_len}, H={H}, K={K}")
     print(f"  Tiles: NT={NT}, num_k_tiles={num_k_tiles}")
     print(f"  SMEM: {smem_bytes} bytes\n")
     
     kda_Akk_kernel(
-        tma_atom_g,
-        tma_tensor_g,
-        tma_atom_q,
+        tiled_copy_g,        # cp.async for G
+        tma_atom_q,          # TMA for Q
         tma_tensor_q,
-        tma_atom_k,
+        tma_atom_k,          # TMA for K
         tma_tensor_k,
-        g_smem_layout,       # 3D: (BC, BK, NUM_STAGES) - with swizzle
-        qk_smem_layout,      # 3D: (BC, BK, NUM_STAGES * 2) - with swizzle
+        g_tensor,
         beta_tensor,
         Akk_tensor,
         Aqk_tensor,
+        g_smem_layout,       # 3D: (BC, BK, NUM_STAGES) - with padding, no swizzle
+        qk_smem_layout,      # 3D ComposedLayout: (BC, BK, NUM_STAGES * 2) - with swizzle
         accum_smem_layout,
         beta_smem_layout,
         tiled_mma,           # MMA configuration
@@ -839,7 +853,8 @@ def run_kda_Akk(
         seq_len,
         scale,
     ).launch(
-        grid=(B, NT, H),
+        # grid=(B, NT, H),
+        grid=(1, 1, 1),
         block=[NUM_THREADS, 1, 1],
         smem=smem_bytes,
         stream=stream,
@@ -847,7 +862,7 @@ def run_kda_Akk(
 
 
 if __name__ == "__main__":
-    print("KDA Akk TMA Test")
+    print("KDA Akk (G:cpasync + QK:TMA + ldmatrix) Test")
     print("=" * 50)
     
     # Test parameters
@@ -961,19 +976,6 @@ if __name__ == "__main__":
     print(f"  max |CuTe - Triton| = {max_diff_akk:.6e}")
     print(f"  mean|CuTe - Triton| = {mean_diff_akk:.6e}")
     
-    # Print sample for inspection (b=0, h=0, first sub-chunk)
-    # print("\n--- Sample: Aqk[0, 0:8, 0, 0:8] ---")
-    # print("CuTe:")
-    # print(Aqk[0, 0:8, 0, 0:8].detach().cpu())
-    # print("Triton:")
-    # print(Aqk_ref[0, 0:8, 0, 0:8].detach().cpu())
-    
-    # print("\n--- Sample: Akk[0, 0:8, 0, 0:8] ---")
-    # print("CuTe:")
-    # print(Akk[0, 0:8, 0, 0:8].detach().cpu())
-    # print("Triton:")
-    # print(Akk_ref[0, 0:8, 0, 0:8].detach().cpu())
-    
     # Pass/Fail check
     # TF32 MMA has ~1e-3 relative error, so use relaxed thresholds
     aqk_threshold = 1e-2  # fp16 output
@@ -1047,7 +1049,7 @@ if __name__ == "__main__":
 
     trace_dir = "profiler_traces"
     os.makedirs(trace_dir, exist_ok=True)
-    trace_file = os.path.join(trace_dir, "kda_Akk.json")
+    trace_file = os.path.join(trace_dir, "kda_Akk_g_cpasync_qk_tma_ldmatrix.json")
     profiler.export_chrome_trace(trace_file)
     print(f"  ✓ Profiler trace saved to {trace_file}")
 
@@ -1170,7 +1172,7 @@ if __name__ == "__main__":
         triton_peak_profiler = triton_bw_profiler / peak_bw * 100.0
     
     # =============== Summary Table ===============
-    print("TMA LDMatrix KDA Akk")
+    print("G:cpasync + QK:TMA + LDMatrix KDA Akk")
     print("\n" + "=" * 80)
     print(f"Performance Summary (B={B}, T={seq_len}, H={H}, K={K}, Data={data_mb:.1f}MB, Peak={peak_bw}GB/s)")
     print("=" * 80)
