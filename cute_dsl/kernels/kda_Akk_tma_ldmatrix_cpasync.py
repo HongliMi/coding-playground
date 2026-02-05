@@ -853,8 +853,8 @@ def run_kda_Akk(
         seq_len,
         scale,
     ).launch(
-        # grid=(B, NT, H),
-        grid=(1, 1, 1),
+        grid=(B, NT, H),
+        # grid=(1, 1, 1),
         block=[NUM_THREADS, 1, 1],
         smem=smem_bytes,
         stream=stream,

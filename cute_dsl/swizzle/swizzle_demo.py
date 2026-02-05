@@ -54,7 +54,7 @@ def show_mapping(B, M, S, num_elements=64, element_size=2):
     print("bank:")
     for i in range(num_elements):
         if i % 32 == 0:
-            j = i // 64
+            j = i // 32
             print()
             print(f"row={j}", end="")
         addr = i * element_size
@@ -66,8 +66,8 @@ def show_mapping(B, M, S, num_elements=64, element_size=2):
 
 if __name__ == "__main__":
     # 修改这三个参数来测试不同的 swizzle 配置
-    B = 3  # 参与 XOR 的位数
-    M = 4  # XOR 目标起始位置
-    S = 3  # XOR 源起始位置
+    B = 2  # 参与 XOR 的位数
+    M = 5  # XOR 目标起始位置
+    S = 2  # XOR 源起始位置
     
-    show_mapping(B, M, S, num_elements=1024, element_size=4)
+    show_mapping(B, M, S, num_elements=8*32, element_size=4)

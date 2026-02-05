@@ -428,6 +428,14 @@ def kda_Akk_kernel(
         sK_stage = sQK[(None, None, stage * 2 + 1)]   # K: (BC, BK)
         sG_stage = sG[(None, None, stage)]            # G: (BC, BK)
         
+        g_r0 = cute.make_rmem_tensor(
+            cute.make_layout((2,), stride=(1,)),
+            cutlass.Float32
+        )
+        g_r1 = cute.make_rmem_tensor(
+            cute.make_layout((2,), stride=(1,)),
+            cutlass.Float32
+        )
         # ========== Fused element-wise + MMA loop using ldmatrix ==========
         for k_iter in cutlass.range_constexpr(2):
             k = k_start + k_iter
@@ -465,16 +473,16 @@ def kda_Akk_kernel(
             # ===== Load G values directly (no swizzle) =====
             gn_0 = sG_stage[(gn_row, k_offset + col)]
             gn_1 = sG_stage[(gn_row, k_offset + col + 1)]
-            g_r0_0 = sG_stage[(r0, k_offset + col)]
-            g_r0_1 = sG_stage[(r0, k_offset + col + 1)]
-            g_r1_0 = sG_stage[(r1, k_offset + col)]
-            g_r1_1 = sG_stage[(r1, k_offset + col + 1)]
-            
+
+            for i in cutlass.range_constexpr(2):
+                g_r0[i] = sG_stage[(r0, k_offset + col + i)]
+                g_r1[i] = sG_stage[(r1, k_offset + col + i)]
+
             # ===== Compute exp2 factors =====
-            b_gm_r0_0 = g_r0_0 - gn_0
-            b_gm_r0_1 = g_r0_1 - gn_1
-            b_gm_r1_0 = g_r1_0 - gn_0
-            b_gm_r1_1 = g_r1_1 - gn_1
+            b_gm_r0_0 = g_r0[0] - gn_0
+            b_gm_r0_1 = g_r0[1] - gn_1
+            b_gm_r1_0 = g_r1[0] - gn_0
+            b_gm_r1_1 = g_r1[1] - gn_1
             
             gq_r0_0 = cute.math.exp2(b_gm_r0_0)
             gq_r0_1 = cute.math.exp2(b_gm_r0_1)
@@ -741,10 +749,18 @@ def run_kda_Akk(
     k_view = cute.make_tensor(k_tensor.iterator, gqk_view_layout)
     
     # =============== SMEM layouts ===============
-    # G: Swizzled layout for TMA (same pattern as Q/K but for float32)
-    smem_atom_g = tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Float32)
+    # G: K-major layout with custom swizzle S<2,5,2> for Float32
+    # For Float32 (32-bit), num_contiguous_bits = 1024 -> num_contiguous_elems = 1024 // 32 = 32
+    # K-major: (8, 32), stride=(32, 1) - 8 rows, 32 cols, column-major within tile
+    sw_g = cute.make_swizzle(2, 5, 2)  # S<2,5,2> like MN_SW128_32B but for K-major
+    outer_g = cute.make_layout((8, 32), stride=(32, 1))  # K-major layout
+    smem_atom_g = cute.make_composed_layout(sw_g, 0, outer_g)
     g_smem_layout_2d = cute.tile_to_shape(smem_atom_g, (BC, BK), order=(0, 1))
     g_smem_layout = cute.tile_to_shape(smem_atom_g, (BC, BK, NUM_STAGES), order=(0, 1, 2))
+
+    print(f"g_smem_layout: {g_smem_layout}")
+    print(f"g_smem_atom: {smem_atom_g}")
+    print(f"g_smem_atom_2d: {g_smem_layout_2d}")
     
     # Q/K: Swizzled layout for TMA + ldmatrix
     smem_atom_qk = tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Float16)
@@ -840,6 +856,7 @@ def run_kda_Akk(
         scale,
     ).launch(
         grid=(B, NT, H),
+        # grid=(1, 1, 1),
         block=[NUM_THREADS, 1, 1],
         smem=smem_bytes,
         stream=stream,
