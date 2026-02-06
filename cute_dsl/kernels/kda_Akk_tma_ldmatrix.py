@@ -174,6 +174,7 @@ def kda_Akk_kernel(
     tiled_mma: cute.TiledMma,    # MMA configuration for ldmatrix
     tiled_copy_Q: cute.TiledCopy, # ldmatrix for Q (16x8)
     tiled_copy_K: cute.TiledCopy, # ldmatrix for K (8x8)
+    tiled_copy_G: cute.TiledCopy, # s2r for G (16x8), MMA C layout: (8,4) threads, 2 vals each
     BT: cutlass.Constexpr[int],
     num_k_tiles: cutlass.Constexpr[int],
     seq_len: int,                # sequence length
@@ -398,10 +399,11 @@ def kda_Akk_kernel(
         tid_in_group = lane_id % 4   # 0-3, determines cols within 8-col tile (tid*2 and tid*2+1)
         k_start = warp_id * 2        # warp 0 -> k=0,1; warp 1 -> k=2,3; etc.
         
-        # Get thread slices for ldmatrix
+        # Get thread slices for ldmatrix and G copy
         thr_mma = tiled_mma.get_slice(lane_id)
         thr_copy_Q = tiled_copy_Q.get_slice(lane_id)
         thr_copy_K = tiled_copy_K.get_slice(lane_id)
+        thr_copy_G = tiled_copy_G.get_slice(lane_id)
         
         # ========== Reset accumulators at k_tile == 0 (new t_sub) ==========
         if k_tile == 0:
@@ -428,14 +430,6 @@ def kda_Akk_kernel(
         sK_stage = sQK[(None, None, stage * 2 + 1)]   # K: (BC, BK)
         sG_stage = sG[(None, None, stage)]            # G: (BC, BK)
         
-        g_r0 = cute.make_rmem_tensor(
-            cute.make_layout((2,), stride=(1,)),
-            cutlass.Float32
-        )
-        g_r1 = cute.make_rmem_tensor(
-            cute.make_layout((2,), stride=(1,)),
-            cutlass.Float32
-        )
         # ========== Fused element-wise + MMA loop using ldmatrix ==========
         for k_iter in cutlass.range_constexpr(2):
             k = k_start + k_iter
@@ -470,19 +464,25 @@ def kda_Akk_kernel(
             tCrK_n1_view = thr_copy_K.retile(tCrK_n1)
             cute.copy(tiled_copy_K, tCsK_n1_view, tCrK_n1_view)
             
-            # ===== Load G values directly (no swizzle) =====
+            # ===== Load G tile (16x8) via tiled copy: (8,4) threads, 2 vals each =====
             gn_0 = sG_stage[(gn_row, k_offset + col)]
             gn_1 = sG_stage[(gn_row, k_offset + col + 1)]
 
-            for i in cutlass.range_constexpr(2):
-                g_r0[i] = sG_stage[(r0, k_offset + col + i)]
-                g_r1[i] = sG_stage[(r1, k_offset + col + i)]
+            sG_tile = cute.local_tile(sG_stage, tiler=(16, 8), coord=(0, k))
+            tCsG = thr_mma.partition_C(sG_tile)
+            tCrG = tiled_mma.make_fragment_C(tCsG)
+            cute.copy(tiled_copy_G, thr_copy_G.partition_S(sG_tile), thr_copy_G.retile(tCrG))
 
             # ===== Compute exp2 factors =====
-            b_gm_r0_0 = g_r0[0] - gn_0
-            b_gm_r0_1 = g_r0[1] - gn_1
-            b_gm_r1_0 = g_r1[0] - gn_0
-            b_gm_r1_1 = g_r1[1] - gn_1
+            # tCrG layout (MMA C/D m16n8k8):
+            #   [0] = G[group_id, tid*2]
+            #   [1] = G[group_id, tid*2+1]
+            #   [2] = G[group_id+8, tid*2]
+            #   [3] = G[group_id+8, tid*2+1]
+            b_gm_r0_0 = tCrG[0] - gn_0
+            b_gm_r0_1 = tCrG[1] - gn_1
+            b_gm_r1_0 = tCrG[2] - gn_0
+            b_gm_r1_1 = tCrG[3] - gn_1
             
             gq_r0_0 = cute.math.exp2(b_gm_r0_0)
             gq_r0_1 = cute.math.exp2(b_gm_r0_1)
@@ -797,6 +797,16 @@ def run_kda_Akk(
     atom_copy_K = cute.make_copy_atom(cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 1), cutlass.Float16)
     tiled_copy_K = cute.make_tiled_copy_B(atom_copy_K, tiled_mma)
     
+    # TiledCopy for G: SMEM->Register matching MMA C/D layout
+    # Thread layout: (8,4), each copy instruction loads 2 Float32 (64 bits)
+    # Covers a (16,8) tile in 2 rounds per thread
+    copy_atom_G_s2r = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(),
+        cutlass.Float32,
+        num_bits_per_copy=64  # 2 x Float32 = 64 bits
+    )
+    tiled_copy_G_s2r = cute.make_tiled_copy_C(copy_atom_G_s2r, tiled_mma)
+    
     # =============== SMEM layouts ===============
     # g/q/k use swizzle layouts defined above (g_smem_layout_swizzle, qk_smem_layout_swizzle)
     # Only need to define accum and beta layouts here
@@ -850,6 +860,7 @@ def run_kda_Akk(
         tiled_mma,           # MMA configuration
         tiled_copy_Q,        # ldmatrix for Q
         tiled_copy_K,        # ldmatrix for K
+        tiled_copy_G_s2r,    # s2r for G matching MMA C layout
         BT,
         num_k_tiles,
         seq_len,
@@ -880,6 +891,11 @@ if __name__ == "__main__":
     q = torch.randn(B, seq_len, H, K, dtype=torch.float16, device='cuda')
     k = torch.randn(B, seq_len, H, K, dtype=torch.float16, device='cuda')
     beta = torch.randn(B, seq_len, H, dtype=torch.float16, device='cuda')
+    # L2 norm for k
+    # q = q / (q.norm(dim=-1, keepdim=True) + 1e-6)
+    # q = q.to(torch.float16)
+    # k = k / (k.norm(dim=-1, keepdim=True) + 1e-6)
+    # k = k.to(torch.float16)
     
     # Output tensors (debug writeback buffers)
     # - Akk: (B, seq_len, H, BC) fp32
@@ -993,7 +1009,7 @@ if __name__ == "__main__":
     
     # Pass/Fail check
     # TF32 MMA has ~1e-3 relative error, so use relaxed thresholds
-    aqk_threshold = 1e-2  # fp16 output
+    aqk_threshold = 1e-3  # fp16 output
     akk_threshold = 1e-3  # fp32 output
     
     if max_diff_aqk > aqk_threshold or max_diff_akk > akk_threshold:
