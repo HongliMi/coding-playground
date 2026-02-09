@@ -13,6 +13,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 import cuda.bindings.driver as cuda
 import json
+import numpy as np
 import os
 import sys
 
@@ -892,16 +893,16 @@ if __name__ == "__main__":
     k = torch.randn(B, seq_len, H, K, dtype=torch.float16, device='cuda')
     beta = torch.randn(B, seq_len, H, dtype=torch.float16, device='cuda')
     # L2 norm for k
-    # q = q / (q.norm(dim=-1, keepdim=True) + 1e-6)
-    # q = q.to(torch.float16)
-    # k = k / (k.norm(dim=-1, keepdim=True) + 1e-6)
-    # k = k.to(torch.float16)
+    q = q / (q.norm(dim=-1, keepdim=True) + 1e-6)
+    q = q.to(torch.float16)
+    k = k / (k.norm(dim=-1, keepdim=True) + 1e-6)
+    k = k.to(torch.float16)
     
     # Output tensors (debug writeback buffers)
     # - Akk: (B, seq_len, H, BC) fp32
     # - Aqk: (B, seq_len, H, BT) fp16
-    Akk = torch.empty(B, seq_len, H, BC, dtype=torch.float32, device='cuda')
-    Aqk = torch.empty(B, seq_len, H, BT, dtype=torch.float16, device='cuda')
+    Akk = torch.zeros(B, seq_len, H, BC, dtype=torch.float32, device='cuda')
+    Aqk = torch.zeros(B, seq_len, H, BT, dtype=torch.float16, device='cuda')
     
     # Create cute tensors
     g_tensor = from_dlpack(g, assumed_align=16)
@@ -944,8 +945,8 @@ if __name__ == "__main__":
     print("=" * 50)
     
     # Allocate reference outputs
-    Aqk_ref = torch.empty(B, seq_len, H, BT, device='cuda', dtype=torch.float16)
-    Akk_ref = torch.empty(B, seq_len, H, BC, device='cuda', dtype=torch.float32)
+    Aqk_ref = torch.zeros(B, seq_len, H, BT, device='cuda', dtype=torch.float16)
+    Akk_ref = torch.zeros(B, seq_len, H, BC, device='cuda', dtype=torch.float32)
     
     # Run Triton reference kernel
     NT = triton.cdiv(seq_len, BT)
