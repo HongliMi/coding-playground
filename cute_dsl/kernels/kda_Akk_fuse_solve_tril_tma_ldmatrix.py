@@ -65,88 +65,6 @@ def mma_tf32_m16n8k8(
 
 
 # ===========================================================================
-# Manual load/store for TF32 MMA (from mma_tf32_16x16.py)
-# ===========================================================================
-@dsl_user_op
-def load_A_tf32(
-    sA: cute.Tensor,  # (16, 8) FP32 in SMEM, row-major
-    lane_id,
-    *, loc=None, ip=None
-):
-    """
-    Load A matrix (16x8) from SMEM to registers for TF32 MMA.
-    
-    Register layout (from PTX ISA):
-    - group_id = lane_id / 4 (0-7)
-    - tid_in_group = lane_id % 4 (0-3)
-    - a0 = A[group_id,     tid_in_group]
-    - a1 = A[group_id + 8, tid_in_group]
-    - a2 = A[group_id,     tid_in_group + 4]
-    - a3 = A[group_id + 8, tid_in_group + 4]
-    """
-    group_id = lane_id // 4
-    tid_in_group = (lane_id % 4) * 2
-    
-    a0 = cutlass.Float32(sA[group_id, tid_in_group])
-    a1 = cutlass.Float32(sA[group_id + 8, tid_in_group])
-    a2 = cutlass.Float32(sA[group_id, tid_in_group + 1])
-    a3 = cutlass.Float32(sA[group_id + 8, tid_in_group + 1])
-    
-    return a0, a1, a2, a3
-
-
-@dsl_user_op
-def load_B_tf32_from_rowmajor(
-    sB: cute.Tensor,  # (8, 8) FP32 in SMEM, row-major
-    lane_id,
-    *, loc=None, ip=None
-):
-    """
-    Load B matrix (8x8) from row-major SMEM to registers for TF32 MMA.
-    MMA expects B in col-major, so we load transposed.
-    
-    For B in row-major: B[row, col]
-    MMA wants col-major view, so we read with swapped indices.
-    """
-    group_id = lane_id // 4
-    tid_in_group = (lane_id % 4) * 2
-    
-    # Load with transposed indices (swap row/col)
-    b0 = cutlass.Float32(sB[group_id, tid_in_group])
-    b1 = cutlass.Float32(sB[group_id, tid_in_group + 1])
-    
-    return b0, b1
-
-
-@dsl_user_op
-def store_C_tf32(
-    sC: cute.Tensor,  # (16, 8) FP32 in SMEM, row-major
-    c0, c1, c2, c3,   # 4 FP32 registers
-    lane_id,
-    *, loc=None, ip=None
-):
-    """
-    Store C/D matrix (16x8) from registers to SMEM.
-    
-    Register layout:
-    - group_id = lane_id / 4 (0-7)
-    - tid_in_group = lane_id % 4 (0-3)
-    - c0 -> C[group_id, tid_in_group * 2]
-    - c1 -> C[group_id, tid_in_group * 2 + 1]
-    - c2 -> C[group_id + 8, tid_in_group * 2]
-    - c3 -> C[group_id + 8, tid_in_group * 2 + 1]
-    """
-    group_id = lane_id // 4
-    tid_in_group = lane_id % 4
-    
-    sC[group_id, tid_in_group * 2] = c0
-    sC[group_id, tid_in_group * 2 + 1] = c1
-    sC[group_id + 8, tid_in_group * 2] = c2
-    sC[group_id + 8, tid_in_group * 2 + 1] = c3
-
-
-
-# ===========================================================================
 # Helper: 16x16 diagonal block inversion (FP32 output)
 # ===========================================================================
 @dsl_user_op
@@ -159,263 +77,70 @@ def _invert_16x16_halfwarp_fp32(
     loc=None,
     ip=None,
 ):
-    """Invert a 16x16 unit lower triangular block, write FP32 result."""
+    """Invert a 16x16 unit lower triangular block, write FP32 result.
+    
+    Register-optimized: eliminates rA register array by re-reading values
+    from shared memory (sA_in). Sums are computed incrementally so only
+    one shuffle result + one SMEM read are live at a time (instead of up
+    to 14 shuffle results simultaneously at d=15).
+    
+    Register savings vs original manual unrolling:
+      - rA[16] eliminated:  ~16 FP32 registers saved
+      - Named shuffle temps eliminated: ~14 FP32 registers saved at peak
+      - Total: ~30 fewer live registers at peak (d=15)
+    """
     my_row = lane_id % 16
     halfwarp_base = (lane_id // 16) * 16
     
     row_off = diag_offset
     col_off = diag_offset
     
-    # Registers for computation (FP32)
+    # Only rInv register array needed (rA eliminated - values re-read from sA_in)
     rInv = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), cutlass.Float32)
-    rA = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), cutlass.Float32)
     
     rInv[0] = cutlass.Float32(1.0)
     for x in range(1, 16):
         rInv[x] = cutlass.Float32(0.0)
-    for x in range(16):
-        rA[x] = cutlass.Float32(0.0)
     
-    # Compute inverse using anti-diagonal sweeps
-    # d=1
-    col1 = my_row - 1
-    valid1 = cutlass.Float32(col1 >= 0)
-    a_val1 = cutlass.Float32(sA_in[row_off + my_row, col_off + col1]) * valid1
-    rA[1] = a_val1
-    rInv[1] = -a_val1
-    
-    # d=2
-    col2 = my_row - 2
-    valid2 = cutlass.Float32(col2 >= 0)
-    a_val2 = cutlass.Float32(sA_in[row_off + my_row, col_off + col2]) * valid2
-    rA[2] = a_val2
-    inv_from_row1 = cute.arch.shuffle_sync(rInv[1], halfwarp_base + my_row - 1)
-    sum2 = rA[1] * inv_from_row1
-    rInv[2] = (-a_val2 - sum2) * valid2
-    
-    # d=3
-    col3 = my_row - 3
-    valid3 = cutlass.Float32(col3 >= 0)
-    a_val3 = cutlass.Float32(sA_in[row_off + my_row, col_off + col3]) * valid3
-    rA[3] = a_val3
-    inv_d3_k1 = cute.arch.shuffle_sync(rInv[1], halfwarp_base + my_row - 2)
-    inv_d3_k2 = cute.arch.shuffle_sync(rInv[2], halfwarp_base + my_row - 1)
-    sum3 = rA[2] * inv_d3_k1 + rA[1] * inv_d3_k2
-    rInv[3] = (-a_val3 - sum3) * valid3
-    
-    col4 = my_row - 4
-    valid4 = cutlass.Float32(col4 >= 0)
-    a_val4 = cutlass.Float32(sA_in[row_off + my_row, col_off + col4]) * valid4
-    rA[4] = a_val4
-    inv_d4_k1 = cute.arch.shuffle_sync(rInv[1], halfwarp_base + my_row - 3)
-    inv_d4_k2 = cute.arch.shuffle_sync(rInv[2], halfwarp_base + my_row - 2)
-    inv_d4_k3 = cute.arch.shuffle_sync(rInv[3], halfwarp_base + my_row - 1)
-    sum4 = rA[3] * inv_d4_k1 + rA[2] * inv_d4_k2 + rA[1] * inv_d4_k3
-    rInv[4] = (-a_val4 - sum4) * valid4
-    
-    col5 = my_row - 5
-    valid5 = cutlass.Float32(col5 >= 0)
-    a_val5 = cutlass.Float32(sA_in[row_off + my_row, col_off + col5]) * valid5
-    rA[5] = a_val5
-    inv_d5_k1 = cute.arch.shuffle_sync(rInv[1], halfwarp_base + my_row - 4)
-    inv_d5_k2 = cute.arch.shuffle_sync(rInv[2], halfwarp_base + my_row - 3)
-    inv_d5_k3 = cute.arch.shuffle_sync(rInv[3], halfwarp_base + my_row - 2)
-    inv_d5_k4 = cute.arch.shuffle_sync(rInv[4], halfwarp_base + my_row - 1)
-    sum5 = rA[4] * inv_d5_k1 + rA[3] * inv_d5_k2 + rA[2] * inv_d5_k3 + rA[1] * inv_d5_k4
-    rInv[5] = (-a_val5 - sum5) * valid5
-    
-    col6 = my_row - 6
-    valid6 = cutlass.Float32(col6 >= 0)
-    a_val6 = cutlass.Float32(sA_in[row_off + my_row, col_off + col6]) * valid6
-    rA[6] = a_val6
-    inv_d6_k1 = cute.arch.shuffle_sync(rInv[1], halfwarp_base + my_row - 5)
-    inv_d6_k2 = cute.arch.shuffle_sync(rInv[2], halfwarp_base + my_row - 4)
-    inv_d6_k3 = cute.arch.shuffle_sync(rInv[3], halfwarp_base + my_row - 3)
-    inv_d6_k4 = cute.arch.shuffle_sync(rInv[4], halfwarp_base + my_row - 2)
-    inv_d6_k5 = cute.arch.shuffle_sync(rInv[5], halfwarp_base + my_row - 1)
-    sum6 = rA[5] * inv_d6_k1 + rA[4] * inv_d6_k2 + rA[3] * inv_d6_k3 + rA[2] * inv_d6_k4 + rA[1] * inv_d6_k5
-    rInv[6] = (-a_val6 - sum6) * valid6
-    
-    col7 = my_row - 7
-    valid7 = cutlass.Float32(col7 >= 0)
-    a_val7 = cutlass.Float32(sA_in[row_off + my_row, col_off + col7]) * valid7
-    rA[7] = a_val7
-    inv_d7_k1 = cute.arch.shuffle_sync(rInv[1], halfwarp_base + my_row - 6)
-    inv_d7_k2 = cute.arch.shuffle_sync(rInv[2], halfwarp_base + my_row - 5)
-    inv_d7_k3 = cute.arch.shuffle_sync(rInv[3], halfwarp_base + my_row - 4)
-    inv_d7_k4 = cute.arch.shuffle_sync(rInv[4], halfwarp_base + my_row - 3)
-    inv_d7_k5 = cute.arch.shuffle_sync(rInv[5], halfwarp_base + my_row - 2)
-    inv_d7_k6 = cute.arch.shuffle_sync(rInv[6], halfwarp_base + my_row - 1)
-    sum7 = rA[6] * inv_d7_k1 + rA[5] * inv_d7_k2 + rA[4] * inv_d7_k3 + rA[3] * inv_d7_k4 + rA[2] * inv_d7_k5 + rA[1] * inv_d7_k6
-    rInv[7] = (-a_val7 - sum7) * valid7
-    
-    col8 = my_row - 8
-    valid8 = cutlass.Float32(col8 >= 0)
-    a_val8 = cutlass.Float32(sA_in[row_off + my_row, col_off + col8]) * valid8
-    rA[8] = a_val8
-    inv_d8_k1 = cute.arch.shuffle_sync(rInv[1], halfwarp_base + my_row - 7)
-    inv_d8_k2 = cute.arch.shuffle_sync(rInv[2], halfwarp_base + my_row - 6)
-    inv_d8_k3 = cute.arch.shuffle_sync(rInv[3], halfwarp_base + my_row - 5)
-    inv_d8_k4 = cute.arch.shuffle_sync(rInv[4], halfwarp_base + my_row - 4)
-    inv_d8_k5 = cute.arch.shuffle_sync(rInv[5], halfwarp_base + my_row - 3)
-    inv_d8_k6 = cute.arch.shuffle_sync(rInv[6], halfwarp_base + my_row - 2)
-    inv_d8_k7 = cute.arch.shuffle_sync(rInv[7], halfwarp_base + my_row - 1)
-    sum8 = rA[7] * inv_d8_k1 + rA[6] * inv_d8_k2 + rA[5] * inv_d8_k3 + rA[4] * inv_d8_k4 + rA[3] * inv_d8_k5 + rA[2] * inv_d8_k6 + rA[1] * inv_d8_k7
-    rInv[8] = (-a_val8 - sum8) * valid8
-    
-    col9 = my_row - 9
-    valid9 = cutlass.Float32(col9 >= 0)
-    a_val9 = cutlass.Float32(sA_in[row_off + my_row, col_off + col9]) * valid9
-    rA[9] = a_val9
-    inv_d9_k1 = cute.arch.shuffle_sync(rInv[1], halfwarp_base + my_row - 8)
-    inv_d9_k2 = cute.arch.shuffle_sync(rInv[2], halfwarp_base + my_row - 7)
-    inv_d9_k3 = cute.arch.shuffle_sync(rInv[3], halfwarp_base + my_row - 6)
-    inv_d9_k4 = cute.arch.shuffle_sync(rInv[4], halfwarp_base + my_row - 5)
-    inv_d9_k5 = cute.arch.shuffle_sync(rInv[5], halfwarp_base + my_row - 4)
-    inv_d9_k6 = cute.arch.shuffle_sync(rInv[6], halfwarp_base + my_row - 3)
-    inv_d9_k7 = cute.arch.shuffle_sync(rInv[7], halfwarp_base + my_row - 2)
-    inv_d9_k8 = cute.arch.shuffle_sync(rInv[8], halfwarp_base + my_row - 1)
-    sum9 = rA[8] * inv_d9_k1 + rA[7] * inv_d9_k2 + rA[6] * inv_d9_k3 + rA[5] * inv_d9_k4 + rA[4] * inv_d9_k5 + rA[3] * inv_d9_k6 + rA[2] * inv_d9_k7 + rA[1] * inv_d9_k8
-    rInv[9] = (-a_val9 - sum9) * valid9
-    
-    col10 = my_row - 10
-    valid10 = cutlass.Float32(col10 >= 0)
-    a_val10 = cutlass.Float32(sA_in[row_off + my_row, col_off + col10]) * valid10
-    rA[10] = a_val10
-    inv_d10_k1 = cute.arch.shuffle_sync(rInv[1], halfwarp_base + my_row - 9)
-    inv_d10_k2 = cute.arch.shuffle_sync(rInv[2], halfwarp_base + my_row - 8)
-    inv_d10_k3 = cute.arch.shuffle_sync(rInv[3], halfwarp_base + my_row - 7)
-    inv_d10_k4 = cute.arch.shuffle_sync(rInv[4], halfwarp_base + my_row - 6)
-    inv_d10_k5 = cute.arch.shuffle_sync(rInv[5], halfwarp_base + my_row - 5)
-    inv_d10_k6 = cute.arch.shuffle_sync(rInv[6], halfwarp_base + my_row - 4)
-    inv_d10_k7 = cute.arch.shuffle_sync(rInv[7], halfwarp_base + my_row - 3)
-    inv_d10_k8 = cute.arch.shuffle_sync(rInv[8], halfwarp_base + my_row - 2)
-    inv_d10_k9 = cute.arch.shuffle_sync(rInv[9], halfwarp_base + my_row - 1)
-    sum10 = rA[9] * inv_d10_k1 + rA[8] * inv_d10_k2 + rA[7] * inv_d10_k3 + rA[6] * inv_d10_k4 + rA[5] * inv_d10_k5 + rA[4] * inv_d10_k6 + rA[3] * inv_d10_k7 + rA[2] * inv_d10_k8 + rA[1] * inv_d10_k9
-    rInv[10] = (-a_val10 - sum10) * valid10
-    
-    col11 = my_row - 11
-    valid11 = cutlass.Float32(col11 >= 0)
-    a_val11 = cutlass.Float32(sA_in[row_off + my_row, col_off + col11]) * valid11
-    rA[11] = a_val11
-    inv_d11_k1 = cute.arch.shuffle_sync(rInv[1], halfwarp_base + my_row - 10)
-    inv_d11_k2 = cute.arch.shuffle_sync(rInv[2], halfwarp_base + my_row - 9)
-    inv_d11_k3 = cute.arch.shuffle_sync(rInv[3], halfwarp_base + my_row - 8)
-    inv_d11_k4 = cute.arch.shuffle_sync(rInv[4], halfwarp_base + my_row - 7)
-    inv_d11_k5 = cute.arch.shuffle_sync(rInv[5], halfwarp_base + my_row - 6)
-    inv_d11_k6 = cute.arch.shuffle_sync(rInv[6], halfwarp_base + my_row - 5)
-    inv_d11_k7 = cute.arch.shuffle_sync(rInv[7], halfwarp_base + my_row - 4)
-    inv_d11_k8 = cute.arch.shuffle_sync(rInv[8], halfwarp_base + my_row - 3)
-    inv_d11_k9 = cute.arch.shuffle_sync(rInv[9], halfwarp_base + my_row - 2)
-    inv_d11_k10 = cute.arch.shuffle_sync(rInv[10], halfwarp_base + my_row - 1)
-    sum11 = rA[10] * inv_d11_k1 + rA[9] * inv_d11_k2 + rA[8] * inv_d11_k3 + rA[7] * inv_d11_k4 + rA[6] * inv_d11_k5 + rA[5] * inv_d11_k6 + rA[4] * inv_d11_k7 + rA[3] * inv_d11_k8 + rA[2] * inv_d11_k9 + rA[1] * inv_d11_k10
-    rInv[11] = (-a_val11 - sum11) * valid11
-    
-    col12 = my_row - 12
-    valid12 = cutlass.Float32(col12 >= 0)
-    a_val12 = cutlass.Float32(sA_in[row_off + my_row, col_off + col12]) * valid12
-    rA[12] = a_val12
-    inv_d12_k1 = cute.arch.shuffle_sync(rInv[1], halfwarp_base + my_row - 11)
-    inv_d12_k2 = cute.arch.shuffle_sync(rInv[2], halfwarp_base + my_row - 10)
-    inv_d12_k3 = cute.arch.shuffle_sync(rInv[3], halfwarp_base + my_row - 9)
-    inv_d12_k4 = cute.arch.shuffle_sync(rInv[4], halfwarp_base + my_row - 8)
-    inv_d12_k5 = cute.arch.shuffle_sync(rInv[5], halfwarp_base + my_row - 7)
-    inv_d12_k6 = cute.arch.shuffle_sync(rInv[6], halfwarp_base + my_row - 6)
-    inv_d12_k7 = cute.arch.shuffle_sync(rInv[7], halfwarp_base + my_row - 5)
-    inv_d12_k8 = cute.arch.shuffle_sync(rInv[8], halfwarp_base + my_row - 4)
-    inv_d12_k9 = cute.arch.shuffle_sync(rInv[9], halfwarp_base + my_row - 3)
-    inv_d12_k10 = cute.arch.shuffle_sync(rInv[10], halfwarp_base + my_row - 2)
-    inv_d12_k11 = cute.arch.shuffle_sync(rInv[11], halfwarp_base + my_row - 1)
-    sum12 = rA[11] * inv_d12_k1 + rA[10] * inv_d12_k2 + rA[9] * inv_d12_k3 + rA[8] * inv_d12_k4 + rA[7] * inv_d12_k5 + rA[6] * inv_d12_k6 + rA[5] * inv_d12_k7 + rA[4] * inv_d12_k8 + rA[3] * inv_d12_k9 + rA[2] * inv_d12_k10 + rA[1] * inv_d12_k11
-    rInv[12] = (-a_val12 - sum12) * valid12
-    
-    col13 = my_row - 13
-    valid13 = cutlass.Float32(col13 >= 0)
-    a_val13 = cutlass.Float32(sA_in[row_off + my_row, col_off + col13]) * valid13
-    rA[13] = a_val13
-    inv_d13_k1 = cute.arch.shuffle_sync(rInv[1], halfwarp_base + my_row - 12)
-    inv_d13_k2 = cute.arch.shuffle_sync(rInv[2], halfwarp_base + my_row - 11)
-    inv_d13_k3 = cute.arch.shuffle_sync(rInv[3], halfwarp_base + my_row - 10)
-    inv_d13_k4 = cute.arch.shuffle_sync(rInv[4], halfwarp_base + my_row - 9)
-    inv_d13_k5 = cute.arch.shuffle_sync(rInv[5], halfwarp_base + my_row - 8)
-    inv_d13_k6 = cute.arch.shuffle_sync(rInv[6], halfwarp_base + my_row - 7)
-    inv_d13_k7 = cute.arch.shuffle_sync(rInv[7], halfwarp_base + my_row - 6)
-    inv_d13_k8 = cute.arch.shuffle_sync(rInv[8], halfwarp_base + my_row - 5)
-    inv_d13_k9 = cute.arch.shuffle_sync(rInv[9], halfwarp_base + my_row - 4)
-    inv_d13_k10 = cute.arch.shuffle_sync(rInv[10], halfwarp_base + my_row - 3)
-    inv_d13_k11 = cute.arch.shuffle_sync(rInv[11], halfwarp_base + my_row - 2)
-    inv_d13_k12 = cute.arch.shuffle_sync(rInv[12], halfwarp_base + my_row - 1)
-    sum13 = rA[12] * inv_d13_k1 + rA[11] * inv_d13_k2 + rA[10] * inv_d13_k3 + rA[9] * inv_d13_k4 + rA[8] * inv_d13_k5 + rA[7] * inv_d13_k6 + rA[6] * inv_d13_k7 + rA[5] * inv_d13_k8 + rA[4] * inv_d13_k9 + rA[3] * inv_d13_k10 + rA[2] * inv_d13_k11 + rA[1] * inv_d13_k12
-    rInv[13] = (-a_val13 - sum13) * valid13
-    
-    col14 = my_row - 14
-    valid14 = cutlass.Float32(col14 >= 0)
-    a_val14 = cutlass.Float32(sA_in[row_off + my_row, col_off + col14]) * valid14
-    rA[14] = a_val14
-    inv_d14_k1 = cute.arch.shuffle_sync(rInv[1], halfwarp_base + my_row - 13)
-    inv_d14_k2 = cute.arch.shuffle_sync(rInv[2], halfwarp_base + my_row - 12)
-    inv_d14_k3 = cute.arch.shuffle_sync(rInv[3], halfwarp_base + my_row - 11)
-    inv_d14_k4 = cute.arch.shuffle_sync(rInv[4], halfwarp_base + my_row - 10)
-    inv_d14_k5 = cute.arch.shuffle_sync(rInv[5], halfwarp_base + my_row - 9)
-    inv_d14_k6 = cute.arch.shuffle_sync(rInv[6], halfwarp_base + my_row - 8)
-    inv_d14_k7 = cute.arch.shuffle_sync(rInv[7], halfwarp_base + my_row - 7)
-    inv_d14_k8 = cute.arch.shuffle_sync(rInv[8], halfwarp_base + my_row - 6)
-    inv_d14_k9 = cute.arch.shuffle_sync(rInv[9], halfwarp_base + my_row - 5)
-    inv_d14_k10 = cute.arch.shuffle_sync(rInv[10], halfwarp_base + my_row - 4)
-    inv_d14_k11 = cute.arch.shuffle_sync(rInv[11], halfwarp_base + my_row - 3)
-    inv_d14_k12 = cute.arch.shuffle_sync(rInv[12], halfwarp_base + my_row - 2)
-    inv_d14_k13 = cute.arch.shuffle_sync(rInv[13], halfwarp_base + my_row - 1)
-    sum14 = rA[13] * inv_d14_k1 + rA[12] * inv_d14_k2 + rA[11] * inv_d14_k3 + rA[10] * inv_d14_k4 + rA[9] * inv_d14_k5 + rA[8] * inv_d14_k6 + rA[7] * inv_d14_k7 + rA[6] * inv_d14_k8 + rA[5] * inv_d14_k9 + rA[4] * inv_d14_k10 + rA[3] * inv_d14_k11 + rA[2] * inv_d14_k12 + rA[1] * inv_d14_k13
-    rInv[14] = (-a_val14 - sum14) * valid14
-    
-    col15 = my_row - 15
-    valid15 = cutlass.Float32(col15 >= 0)
-    a_val15 = cutlass.Float32(sA_in[row_off + my_row, col_off + col15]) * valid15
-    rA[15] = a_val15
-    inv_d15_k1 = cute.arch.shuffle_sync(rInv[1], halfwarp_base + my_row - 14)
-    inv_d15_k2 = cute.arch.shuffle_sync(rInv[2], halfwarp_base + my_row - 13)
-    inv_d15_k3 = cute.arch.shuffle_sync(rInv[3], halfwarp_base + my_row - 12)
-    inv_d15_k4 = cute.arch.shuffle_sync(rInv[4], halfwarp_base + my_row - 11)
-    inv_d15_k5 = cute.arch.shuffle_sync(rInv[5], halfwarp_base + my_row - 10)
-    inv_d15_k6 = cute.arch.shuffle_sync(rInv[6], halfwarp_base + my_row - 9)
-    inv_d15_k7 = cute.arch.shuffle_sync(rInv[7], halfwarp_base + my_row - 8)
-    inv_d15_k8 = cute.arch.shuffle_sync(rInv[8], halfwarp_base + my_row - 7)
-    inv_d15_k9 = cute.arch.shuffle_sync(rInv[9], halfwarp_base + my_row - 6)
-    inv_d15_k10 = cute.arch.shuffle_sync(rInv[10], halfwarp_base + my_row - 5)
-    inv_d15_k11 = cute.arch.shuffle_sync(rInv[11], halfwarp_base + my_row - 4)
-    inv_d15_k12 = cute.arch.shuffle_sync(rInv[12], halfwarp_base + my_row - 3)
-    inv_d15_k13 = cute.arch.shuffle_sync(rInv[13], halfwarp_base + my_row - 2)
-    inv_d15_k14 = cute.arch.shuffle_sync(rInv[14], halfwarp_base + my_row - 1)
-    sum15 = rA[14] * inv_d15_k1 + rA[13] * inv_d15_k2 + rA[12] * inv_d15_k3 + rA[11] * inv_d15_k4 + rA[10] * inv_d15_k5 + rA[9] * inv_d15_k6 + rA[8] * inv_d15_k7 + rA[7] * inv_d15_k8 + rA[6] * inv_d15_k9 + rA[5] * inv_d15_k10 + rA[4] * inv_d15_k11 + rA[3] * inv_d15_k12 + rA[2] * inv_d15_k13 + rA[1] * inv_d15_k14
-    rInv[15] = (-a_val15 - sum15) * valid15
+    # Anti-diagonal sweep d=1..15
+    # For each d, compute: rInv[d] = (-A[my_row, my_row-d] - sum) * valid
+    # where sum = sum_{j=1}^{d-1} A[my_row, my_row-(d-j)] * shuffle(rInv[j], my_row-d+j)
+    for d in range(1, 16):
+        col_d = my_row - d
+        valid = cutlass.Float32(col_d >= 0)
+        # Read A[my_row, my_row-d] directly from shared memory
+        a_val = cutlass.Float32(sA_in[row_off + my_row, col_off + col_d]) * valid
+        
+        # Incremental sum to minimize live registers:
+        # each iteration only needs acc + one shuffle result + one SMEM read
+        acc = cutlass.Float32(0.0)
+        for j in range(1, d):
+            # Re-read A[my_row, my_row-(d-j)] from SMEM (replaces rA[d-j])
+            a_re = cutlass.Float32(sA_in[row_off + my_row, col_off + my_row - (d - j)])
+            # Get Inv[my_row-d+j, my_row-d] via shuffle from thread (my_row-d+j)
+            inv_shfl = cute.arch.shuffle_sync(rInv[j], halfwarp_base + my_row - d + j)
+            acc = acc + a_re * inv_shfl
+        
+        rInv[d] = (-a_val - acc) * valid
     
     rInv[0] = cutlass.Float32(1.0)
     
-    # Write to FP32 output
+    # Write inverse to FP32 output
     sA_out[row_off + my_row, col_off + my_row] = rInv[0]
-    sA_out[row_off + my_row, col_off + (my_row + 15) % 16] = rInv[1] * cutlass.Float32(my_row >= 1)
-    sA_out[row_off + my_row, col_off + (my_row + 14) % 16] = rInv[2] * cutlass.Float32(my_row >= 2)
-    sA_out[row_off + my_row, col_off + (my_row + 13) % 16] = rInv[3] * cutlass.Float32(my_row >= 3)
-    sA_out[row_off + my_row, col_off + (my_row + 12) % 16] = rInv[4] * cutlass.Float32(my_row >= 4)
-    sA_out[row_off + my_row, col_off + (my_row + 11) % 16] = rInv[5] * cutlass.Float32(my_row >= 5)
-    sA_out[row_off + my_row, col_off + (my_row + 10) % 16] = rInv[6] * cutlass.Float32(my_row >= 6)
-    sA_out[row_off + my_row, col_off + (my_row + 9) % 16] = rInv[7] * cutlass.Float32(my_row >= 7)
-    sA_out[row_off + my_row, col_off + (my_row + 8) % 16] = rInv[8] * cutlass.Float32(my_row >= 8)
-    sA_out[row_off + my_row, col_off + (my_row + 7) % 16] = rInv[9] * cutlass.Float32(my_row >= 9)
-    sA_out[row_off + my_row, col_off + (my_row + 6) % 16] = rInv[10] * cutlass.Float32(my_row >= 10)
-    sA_out[row_off + my_row, col_off + (my_row + 5) % 16] = rInv[11] * cutlass.Float32(my_row >= 11)
-    sA_out[row_off + my_row, col_off + (my_row + 4) % 16] = rInv[12] * cutlass.Float32(my_row >= 12)
-    sA_out[row_off + my_row, col_off + (my_row + 3) % 16] = rInv[13] * cutlass.Float32(my_row >= 13)
-    sA_out[row_off + my_row, col_off + (my_row + 2) % 16] = rInv[14] * cutlass.Float32(my_row >= 14)
-    sA_out[row_off + my_row, col_off + (my_row + 1) % 16] = rInv[15] * cutlass.Float32(my_row >= 15)
+    for d in range(1, 16):
+        sA_out[row_off + my_row, col_off + (my_row + 16 - d) % 16] = rInv[d] * cutlass.Float32(my_row >= d)
 
 
 # 全局配置
 BC = 16          # sub-chunk size (rows)
 BK = 64          # key dimension (columns)
 NUM_STAGES = 2   # double buffer
-NUM_THREADS = 128
 NUM_WARPS = 4
+
+# MMA C layout offsets for m16n16 output (two n-tiles of m16n8k8)
+# Index order: [c00_0, c00_1, c00_2, c00_3, c01_0, c01_1, c01_2, c01_3]
+_C_ROW = [0, 0, 8, 8, 0, 0, 8, 8]   # added to group_id
+_C_COL = [0, 1, 0, 1, 8, 9, 8, 9]   # added to col_base + tid_in_group*2
 
 # 峰值带宽 (GB/s) - 根据不同 GPU 平台修改
 # B200: 8000, H100 SXM: 3350, H100 PCIe: 2000, A100 SXM: 2039, A100 PCIe: 1555
@@ -558,25 +283,13 @@ def kda_Akk_kernel(
             cute.copy(tma_atom_k, tma_gK, tma_sK, tma_bar_ptr=mbar_ptr + stage)
 
     # =============== Main loop ===============
-    # Accumulators defined outside loop - persist across k_tiles within same t_sub
-    # Only need to write to sAccum once at k_tile == num_k_tiles - 1 for reduction
-    aqk_c00_0 = cutlass.Float32(0.0)
-    aqk_c00_1 = cutlass.Float32(0.0)
-    aqk_c00_2 = cutlass.Float32(0.0)
-    aqk_c00_3 = cutlass.Float32(0.0)
-    aqk_c01_0 = cutlass.Float32(0.0)
-    aqk_c01_1 = cutlass.Float32(0.0)
-    aqk_c01_2 = cutlass.Float32(0.0)
-    aqk_c01_3 = cutlass.Float32(0.0)
-    
-    akk_c00_0 = cutlass.Float32(0.0)
-    akk_c00_1 = cutlass.Float32(0.0)
-    akk_c00_2 = cutlass.Float32(0.0)
-    akk_c00_3 = cutlass.Float32(0.0)
-    akk_c01_0 = cutlass.Float32(0.0)
-    akk_c01_1 = cutlass.Float32(0.0)
-    akk_c01_2 = cutlass.Float32(0.0)
-    akk_c01_3 = cutlass.Float32(0.0)
+    # Accumulators: rmem_tensor[8] for aqk and akk (m16n16 = 2 n-tiles of m16n8k8)
+    # Index: [c00_0, c00_1, c00_2, c00_3, c01_0, c01_1, c01_2, c01_3]
+    aqk = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), cutlass.Float32)
+    akk = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), cutlass.Float32)
+    for _i in cutlass.range_constexpr(8, unroll=True):
+        aqk[_i] = cutlass.Float32(0.0)
+        akk[_i] = cutlass.Float32(0.0)
     
     for it in range(total_tiles):
         stage = it % NUM_STAGES
@@ -673,23 +386,9 @@ def kda_Akk_kernel(
         
         # ========== Reset accumulators at k_tile == 0 (new t_sub) ==========
         if k_tile == 0:
-            aqk_c00_0 = cutlass.Float32(0.0)
-            aqk_c00_1 = cutlass.Float32(0.0)
-            aqk_c00_2 = cutlass.Float32(0.0)
-            aqk_c00_3 = cutlass.Float32(0.0)
-            aqk_c01_0 = cutlass.Float32(0.0)
-            aqk_c01_1 = cutlass.Float32(0.0)
-            aqk_c01_2 = cutlass.Float32(0.0)
-            aqk_c01_3 = cutlass.Float32(0.0)
-            
-            akk_c00_0 = cutlass.Float32(0.0)
-            akk_c00_1 = cutlass.Float32(0.0)
-            akk_c00_2 = cutlass.Float32(0.0)
-            akk_c00_3 = cutlass.Float32(0.0)
-            akk_c01_0 = cutlass.Float32(0.0)
-            akk_c01_1 = cutlass.Float32(0.0)
-            akk_c01_2 = cutlass.Float32(0.0)
-            akk_c01_3 = cutlass.Float32(0.0)
+            for _i in cutlass.range_constexpr(8, unroll=True):
+                aqk[_i] = cutlass.Float32(0.0)
+                akk[_i] = cutlass.Float32(0.0)
         
         # Get 2D SMEM views for current stage
         sQ_stage = sQK[(None, None, stage * 2)]       # Q: (BC, BK)
@@ -697,7 +396,7 @@ def kda_Akk_kernel(
         sG_stage = sG[(None, None, stage)]            # G: (BC, BK)
         
         # ========== Fused element-wise + MMA loop using ldmatrix ==========
-        for k_iter in cutlass.range_constexpr(2):
+        for k_iter in cutlass.range_constexpr(2, unroll=True):
             k = k_start + k_iter
             k_offset = k * 8  # column offset for this k sub-tile
             col = tid_in_group * 2  # 0,2,4,6 within each 8-col tile
@@ -796,13 +495,12 @@ def kda_Akk_kernel(
             b1_1 = k_r1_1 * gk_r1_1  # b1: k[r1,col+1] * gk
             
             # ===== MMA directly with computed values =====
-            # Aqk MMA: A[16,8] = q*gq, B[8,8] = k*gk (2 tiles for n=16)
-            aqk_c00_0, aqk_c00_1, aqk_c00_2, aqk_c00_3 = mma_tf32_m16n8k8(a_aqk_0, a_aqk_1, a_aqk_2, a_aqk_3, b0_0, b1_0, aqk_c00_0, aqk_c00_1, aqk_c00_2, aqk_c00_3)
-            aqk_c01_0, aqk_c01_1, aqk_c01_2, aqk_c01_3 = mma_tf32_m16n8k8(a_aqk_0, a_aqk_1, a_aqk_2, a_aqk_3, b0_1, b1_1, aqk_c01_0, aqk_c01_1, aqk_c01_2, aqk_c01_3)
-            
+            # Aqk MMA: A[16,8] = q*gq, B[8,8] = k*gk (2 n-tiles for n=16)
+            aqk[0], aqk[1], aqk[2], aqk[3] = mma_tf32_m16n8k8(a_aqk_0, a_aqk_1, a_aqk_2, a_aqk_3, b0_0, b1_0, aqk[0], aqk[1], aqk[2], aqk[3])
+            aqk[4], aqk[5], aqk[6], aqk[7] = mma_tf32_m16n8k8(a_aqk_0, a_aqk_1, a_aqk_2, a_aqk_3, b0_1, b1_1, aqk[4], aqk[5], aqk[6], aqk[7])
             # Akk MMA: A[16,8] = k*gq, B[8,8] = k*gk (reuse B tiles!)
-            akk_c00_0, akk_c00_1, akk_c00_2, akk_c00_3 = mma_tf32_m16n8k8(a_akk_0, a_akk_1, a_akk_2, a_akk_3, b0_0, b1_0, akk_c00_0, akk_c00_1, akk_c00_2, akk_c00_3)
-            akk_c01_0, akk_c01_1, akk_c01_2, akk_c01_3 = mma_tf32_m16n8k8(a_akk_0, a_akk_1, a_akk_2, a_akk_3, b0_1, b1_1, akk_c01_0, akk_c01_1, akk_c01_2, akk_c01_3)
+            akk[0], akk[1], akk[2], akk[3] = mma_tf32_m16n8k8(a_akk_0, a_akk_1, a_akk_2, a_akk_3, b0_0, b1_0, akk[0], akk[1], akk[2], akk[3])
+            akk[4], akk[5], akk[6], akk[7] = mma_tf32_m16n8k8(a_akk_0, a_akk_1, a_akk_2, a_akk_3, b0_1, b1_1, akk[4], akk[5], akk[6], akk[7])
         
         # 6. Tree Reduction: only after processing all k_tiles for this t_sub
         # Uses half SMEM: only need (BC, BC*2, 2) instead of (BC, BC*4, 2)
@@ -821,23 +519,9 @@ def kda_Akk_kernel(
             # ========== Phase 1: Warps 0,1 write to sAccum ==========
             if warp_id < 2:
                 col_base = warp_id * BC  # warp 0: 0, warp 1: 16
-                sAccum[(group_id, col_base + tid_in_group * 2, 0)] = aqk_c00_0
-                sAccum[(group_id, col_base + tid_in_group * 2 + 1, 0)] = aqk_c00_1
-                sAccum[(group_id + 8, col_base + tid_in_group * 2, 0)] = aqk_c00_2
-                sAccum[(group_id + 8, col_base + tid_in_group * 2 + 1, 0)] = aqk_c00_3
-                sAccum[(group_id, col_base + 8 + tid_in_group * 2, 0)] = aqk_c01_0
-                sAccum[(group_id, col_base + 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_1
-                sAccum[(group_id + 8, col_base + 8 + tid_in_group * 2, 0)] = aqk_c01_2
-                sAccum[(group_id + 8, col_base + 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_3
-                
-                sAccum[(group_id, col_base + tid_in_group * 2, 1)] = akk_c00_0
-                sAccum[(group_id, col_base + tid_in_group * 2 + 1, 1)] = akk_c00_1
-                sAccum[(group_id + 8, col_base + tid_in_group * 2, 1)] = akk_c00_2
-                sAccum[(group_id + 8, col_base + tid_in_group * 2 + 1, 1)] = akk_c00_3
-                sAccum[(group_id, col_base + 8 + tid_in_group * 2, 1)] = akk_c01_0
-                sAccum[(group_id, col_base + 8 + tid_in_group * 2 + 1, 1)] = akk_c01_1
-                sAccum[(group_id + 8, col_base + 8 + tid_in_group * 2, 1)] = akk_c01_2
-                sAccum[(group_id + 8, col_base + 8 + tid_in_group * 2 + 1, 1)] = akk_c01_3
+                for _i in cutlass.range_constexpr(8, unroll=True):
+                    sAccum[(group_id + _C_ROW[_i], col_base + tid_in_group * 2 + _C_COL[_i], 0)] = aqk[_i]
+                    sAccum[(group_id + _C_ROW[_i], col_base + tid_in_group * 2 + _C_COL[_i], 1)] = akk[_i]
             
             cute.arch.barrier()
             
@@ -845,106 +529,48 @@ def kda_Akk_kernel(
             # Warp 2 loads warp 0's data (cols 0-15), warp 3 loads warp 1's data (cols 16-31)
             if warp_id >= 2:
                 partner_col_base = (warp_id - 2) * BC  # warp 2: 0, warp 3: 16
-                aqk_c00_0 = aqk_c00_0 + sAccum[(group_id, partner_col_base + tid_in_group * 2, 0)]
-                aqk_c00_1 = aqk_c00_1 + sAccum[(group_id, partner_col_base + tid_in_group * 2 + 1, 0)]
-                aqk_c00_2 = aqk_c00_2 + sAccum[(group_id + 8, partner_col_base + tid_in_group * 2, 0)]
-                aqk_c00_3 = aqk_c00_3 + sAccum[(group_id + 8, partner_col_base + tid_in_group * 2 + 1, 0)]
-                aqk_c01_0 = aqk_c01_0 + sAccum[(group_id, partner_col_base + 8 + tid_in_group * 2, 0)]
-                aqk_c01_1 = aqk_c01_1 + sAccum[(group_id, partner_col_base + 8 + tid_in_group * 2 + 1, 0)]
-                aqk_c01_2 = aqk_c01_2 + sAccum[(group_id + 8, partner_col_base + 8 + tid_in_group * 2, 0)]
-                aqk_c01_3 = aqk_c01_3 + sAccum[(group_id + 8, partner_col_base + 8 + tid_in_group * 2 + 1, 0)]
-                
-                akk_c00_0 = akk_c00_0 + sAccum[(group_id, partner_col_base + tid_in_group * 2, 1)]
-                akk_c00_1 = akk_c00_1 + sAccum[(group_id, partner_col_base + tid_in_group * 2 + 1, 1)]
-                akk_c00_2 = akk_c00_2 + sAccum[(group_id + 8, partner_col_base + tid_in_group * 2, 1)]
-                akk_c00_3 = akk_c00_3 + sAccum[(group_id + 8, partner_col_base + tid_in_group * 2 + 1, 1)]
-                akk_c01_0 = akk_c01_0 + sAccum[(group_id, partner_col_base + 8 + tid_in_group * 2, 1)]
-                akk_c01_1 = akk_c01_1 + sAccum[(group_id, partner_col_base + 8 + tid_in_group * 2 + 1, 1)]
-                akk_c01_2 = akk_c01_2 + sAccum[(group_id + 8, partner_col_base + 8 + tid_in_group * 2, 1)]
-                akk_c01_3 = akk_c01_3 + sAccum[(group_id + 8, partner_col_base + 8 + tid_in_group * 2 + 1, 1)]
+                for _i in cutlass.range_constexpr(8, unroll=True):
+                    aqk[_i] = aqk[_i] + sAccum[(group_id + _C_ROW[_i], partner_col_base + tid_in_group * 2 + _C_COL[_i], 0)]
+                    akk[_i] = akk[_i] + sAccum[(group_id + _C_ROW[_i], partner_col_base + tid_in_group * 2 + _C_COL[_i], 1)]
             
             cute.arch.barrier()
             
             # ========== Phase 3: Warp 2 writes (warp0+warp2) to sAccum cols 0-15 ==========
             if warp_id == 2:
-                sAccum[(group_id, tid_in_group * 2, 0)] = aqk_c00_0
-                sAccum[(group_id, tid_in_group * 2 + 1, 0)] = aqk_c00_1
-                sAccum[(group_id + 8, tid_in_group * 2, 0)] = aqk_c00_2
-                sAccum[(group_id + 8, tid_in_group * 2 + 1, 0)] = aqk_c00_3
-                sAccum[(group_id, 8 + tid_in_group * 2, 0)] = aqk_c01_0
-                sAccum[(group_id, 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_1
-                sAccum[(group_id + 8, 8 + tid_in_group * 2, 0)] = aqk_c01_2
-                sAccum[(group_id + 8, 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_3
-                
-                sAccum[(group_id, tid_in_group * 2, 1)] = akk_c00_0
-                sAccum[(group_id, tid_in_group * 2 + 1, 1)] = akk_c00_1
-                sAccum[(group_id + 8, tid_in_group * 2, 1)] = akk_c00_2
-                sAccum[(group_id + 8, tid_in_group * 2 + 1, 1)] = akk_c00_3
-                sAccum[(group_id, 8 + tid_in_group * 2, 1)] = akk_c01_0
-                sAccum[(group_id, 8 + tid_in_group * 2 + 1, 1)] = akk_c01_1
-                sAccum[(group_id + 8, 8 + tid_in_group * 2, 1)] = akk_c01_2
-                sAccum[(group_id + 8, 8 + tid_in_group * 2 + 1, 1)] = akk_c01_3
+                for _i in cutlass.range_constexpr(8, unroll=True):
+                    sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], 0)] = aqk[_i]
+                    sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], 1)] = akk[_i]
             
             cute.arch.barrier()
             
             # ========== Phase 4: Warp 3 loads (warp0+warp2) and adds to get final ==========
             if warp_id == 3:
-                aqk_c00_0 = aqk_c00_0 + sAccum[(group_id, tid_in_group * 2, 0)]
-                aqk_c00_1 = aqk_c00_1 + sAccum[(group_id, tid_in_group * 2 + 1, 0)]
-                aqk_c00_2 = aqk_c00_2 + sAccum[(group_id + 8, tid_in_group * 2, 0)]
-                aqk_c00_3 = aqk_c00_3 + sAccum[(group_id + 8, tid_in_group * 2 + 1, 0)]
-                aqk_c01_0 = aqk_c01_0 + sAccum[(group_id, 8 + tid_in_group * 2, 0)]
-                aqk_c01_1 = aqk_c01_1 + sAccum[(group_id, 8 + tid_in_group * 2 + 1, 0)]
-                aqk_c01_2 = aqk_c01_2 + sAccum[(group_id + 8, 8 + tid_in_group * 2, 0)]
-                aqk_c01_3 = aqk_c01_3 + sAccum[(group_id + 8, 8 + tid_in_group * 2 + 1, 0)]
-                
-                akk_c00_0 = akk_c00_0 + sAccum[(group_id, tid_in_group * 2, 1)]
-                akk_c00_1 = akk_c00_1 + sAccum[(group_id, tid_in_group * 2 + 1, 1)]
-                akk_c00_2 = akk_c00_2 + sAccum[(group_id + 8, tid_in_group * 2, 1)]
-                akk_c00_3 = akk_c00_3 + sAccum[(group_id + 8, tid_in_group * 2 + 1, 1)]
-                akk_c01_0 = akk_c01_0 + sAccum[(group_id, 8 + tid_in_group * 2, 1)]
-                akk_c01_1 = akk_c01_1 + sAccum[(group_id, 8 + tid_in_group * 2 + 1, 1)]
-                akk_c01_2 = akk_c01_2 + sAccum[(group_id + 8, 8 + tid_in_group * 2, 1)]
-                akk_c01_3 = akk_c01_3 + sAccum[(group_id + 8, 8 + tid_in_group * 2 + 1, 1)]
+                for _i in cutlass.range_constexpr(8, unroll=True):
+                    aqk[_i] = aqk[_i] + sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], 0)]
+                    akk[_i] = akk[_i] + sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], 1)]
             
             cute.arch.barrier()
             
             # ========== Phase 5: Warp 3 writes Aqk to slot 0 + prepared Akk to slot 1 ==========
             if warp_id == 3:
                 # Aqk: raw values to slot 0
-                sAccum[(group_id, tid_in_group * 2, 0)] = aqk_c00_0
-                sAccum[(group_id, tid_in_group * 2 + 1, 0)] = aqk_c00_1
-                sAccum[(group_id + 8, tid_in_group * 2, 0)] = aqk_c00_2
-                sAccum[(group_id + 8, tid_in_group * 2 + 1, 0)] = aqk_c00_3
-                sAccum[(group_id, 8 + tid_in_group * 2, 0)] = aqk_c01_0
-                sAccum[(group_id, 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_1
-                sAccum[(group_id + 8, 8 + tid_in_group * 2, 0)] = aqk_c01_2
-                sAccum[(group_id + 8, 8 + tid_in_group * 2 + 1, 0)] = aqk_c01_3
+                for _i in cutlass.range_constexpr(8, unroll=True):
+                    sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], 0)] = aqk[_i]
                 
                 # Akk: prepare unit lower triangular (diag=1, lower=val*beta, upper=0)
                 # Branchless: prepared = val * beta * float(row > col) + float(row == col)
-                r0 = group_id              # rows 0-7
-                r1 = group_id + 8          # rows 8-15
-                c0 = tid_in_group * 2      # cols 0,2,4,6
-                c1 = tid_in_group * 2 + 1  # cols 1,3,5,7
-                c2 = 8 + tid_in_group * 2  # cols 8,10,12,14
-                c3 = 8 + tid_in_group * 2 + 1  # cols 9,11,13,15
-                beta_r0 = cutlass.Float32(sBeta[(t_sub * BC + r0,)])
-                beta_r1 = cutlass.Float32(sBeta[(t_sub * BC + r1,)])
-                
-                sAccum[(r0, c0, 1)] = akk_c00_0 * beta_r0 * cutlass.Float32(r0 > c0) + cutlass.Float32(r0 == c0)
-                sAccum[(r0, c1, 1)] = akk_c00_1 * beta_r0 * cutlass.Float32(r0 > c1) + cutlass.Float32(r0 == c1)
-                sAccum[(r1, c0, 1)] = akk_c00_2 * beta_r1 * cutlass.Float32(r1 > c0) + cutlass.Float32(r1 == c0)
-                sAccum[(r1, c1, 1)] = akk_c00_3 * beta_r1 * cutlass.Float32(r1 > c1) + cutlass.Float32(r1 == c1)
-                sAccum[(r0, c2, 1)] = akk_c01_0 * beta_r0 * cutlass.Float32(r0 > c2) + cutlass.Float32(r0 == c2)
-                sAccum[(r0, c3, 1)] = akk_c01_1 * beta_r0 * cutlass.Float32(r0 > c3) + cutlass.Float32(r0 == c3)
-                sAccum[(r1, c2, 1)] = akk_c01_2 * beta_r1 * cutlass.Float32(r1 > c2) + cutlass.Float32(r1 == c2)
-                sAccum[(r1, c3, 1)] = akk_c01_3 * beta_r1 * cutlass.Float32(r1 > c3) + cutlass.Float32(r1 == c3)
+                beta_r0 = cutlass.Float32(sBeta[(t_sub * BC + group_id,)])
+                beta_r1 = cutlass.Float32(sBeta[(t_sub * BC + group_id + 8,)])
+                _betas = [beta_r0, beta_r0, beta_r1, beta_r1, beta_r0, beta_r0, beta_r1, beta_r1]
+                for _i in cutlass.range_constexpr(8, unroll=True):
+                    row = group_id + _C_ROW[_i]
+                    col = tid_in_group * 2 + _C_COL[_i]
+                    sAccum[(row, col, 1)] = akk[_i] * _betas[_i] * cutlass.Float32(row > col) + cutlass.Float32(row == col)
             
             cute.arch.barrier()
             
             # ========== Phase 6a: Write Aqk from slot 0 to global ==========
-            for local_row in cutlass.range_constexpr(4):
+            for local_row in cutlass.range_constexpr(4, unroll=True):
                 row = warp_id * 4 + local_row
                 if lane_id < 16:
                     col = lane_id
@@ -963,7 +589,7 @@ def kda_Akk_kernel(
             cute.arch.barrier()
             
             # ========== Phase 6c: Write inverted Akk from slot 0 to global ==========
-            for local_row in cutlass.range_constexpr(4):
+            for local_row in cutlass.range_constexpr(4, unroll=True):
                 row = warp_id * 4 + local_row
                 if lane_id < 16:
                     col = lane_id
@@ -1140,7 +766,7 @@ def run_kda_Akk(
     ).launch(
         grid=(B, NT, H),
         # grid=(1, 1, 1),
-        block=[NUM_THREADS, 1, 1],
+        block=[NUM_WARPS * 32, 1, 1],
         smem=smem_bytes,
         stream=stream,
     )
