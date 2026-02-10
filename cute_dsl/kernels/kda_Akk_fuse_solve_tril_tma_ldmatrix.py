@@ -131,11 +131,32 @@ def _invert_16x16_halfwarp_fp32(
         sA_out[row_off + my_row, col_off + (my_row + 16 - d) % 16] = rInv[d] * cutlass.Float32(my_row >= d)
 
 
+# ===========================================================================
+# Named barrier for compute warps (0-3, 128 threads)
+# ===========================================================================
+@dsl_user_op
+def compute_warp_barrier(*, loc=None, ip=None):
+    """Named barrier sync for compute warps (0-3, 128 threads).
+    Uses bar.sync with barrier_id=2. membar.cta ensures shared memory
+    writes are visible across warps (bar.sync alone only guarantees
+    memory fence when thread_count == CTA size).
+    """
+    llvm.inline_asm(
+        T.i32(),
+        [],
+        "membar.cta; bar.sync 2, 128; mov.u32 $0, 0;",
+        "=r",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+
+
 # 全局配置
 BC = 16          # sub-chunk size (rows)
 BK = 64          # key dimension (columns)
 NUM_STAGES = 2   # double buffer
-NUM_WARPS = 4
+NUM_WARPS = 5    # warps 0-3: MMA compute, warp 4: dedicated writeback + inversion
+NUM_ACC_PIPE_STAGES = 2  # double buffer for accumulator pipeline (warp specialization)
 
 # MMA C layout offsets for m16n16 output (two n-tiles of m16n8k8)
 # Index order: [c00_0, c00_1, c00_2, c00_3, c01_0, c01_1, c01_2, c01_3]
@@ -160,7 +181,7 @@ def kda_Akk_kernel(
     beta_tensor: cute.Tensor,    # (B, T, H) fp16
     Akk_tensor: cute.Tensor,     # (B, T, H, BC) output
     Aqk_tensor: cute.Tensor,     # (B, T, H, BT) output
-    accum_smem_layout: cute.Layout, # (BC, BC * 2, 2) for Aqk and Akk
+    accum_smem_layout: cute.Layout, # (BC, BC * 2, NUM_ACC_PIPE_STAGES * 2) double-buffered Aqk/Akk
     beta_smem_layout: cute.Layout, # (BT,)
     tiled_mma: cute.TiledMma,    # MMA configuration for ldmatrix
     tiled_copy_Q: cute.TiledCopy, # ldmatrix for Q (16x8)
@@ -178,6 +199,8 @@ def kda_Akk_kernel(
       BT=64, BC=16 => 4 tiles along T; K=128, BK=64 => 2 tiles along K; total 8 tiles.
     - G: TMA load without swizzle -> direct indexing for element-wise
     - Q/K: TMA load with swizzle -> ldmatrix for MMA register loading
+    - 5 warps: warps 0-3 do MMA compute + tree reduction,
+      warp 4 is dedicated to writeback (Aqk/Akk) + 16x16 inversion
     """
     
     tidx, _, _ = cute.arch.thread_idx()
@@ -201,6 +224,12 @@ def kda_Akk_kernel(
     # Allocate mbarriers for TMA synchronization (one per stage)
     mbar_ptr = smem.allocate_array(cutlass.Int64, NUM_STAGES)
     
+    # Allocate mbarriers for accumulator pipeline (warp specialization)
+    # acc_full: producer (warp 3, 32 threads) signals data ready -> consumer (warp 4) waits
+    # acc_empty: consumer (warp 4, 1 thread) signals buffer free -> producer (warps 0-3) waits
+    acc_full_mbar_ptr = smem.allocate_array(cutlass.Int64, NUM_ACC_PIPE_STAGES)
+    acc_empty_mbar_ptr = smem.allocate_array(cutlass.Int64, NUM_ACC_PIPE_STAGES)
+    
     # TMA tile size in bytes
     g_tile_bytes = BC * BK * 4   # float32
     qk_tile_bytes = BC * BK * 2  # fp16
@@ -210,8 +239,17 @@ def kda_Akk_kernel(
     if tidx == 0:
         for stage in range(NUM_STAGES):
             cute.arch.mbarrier_init(mbar_ptr + stage, 1)
+        for stage in range(NUM_ACC_PIPE_STAGES):
+            cute.arch.mbarrier_init(acc_full_mbar_ptr + stage, 32)   # 32 threads in warp 3 arrive
+            cute.arch.mbarrier_init(acc_empty_mbar_ptr + stage, 1)   # 1 thread in warp 4 arrives
     cute.arch.mbarrier_init_fence()
     cute.arch.barrier()
+    
+    # Pre-arrive acc_empty mbarriers so buffers start as "empty" (available)
+    # This flips phase from 0->1, so first mbarrier_wait(phase=0) succeeds immediately
+    if tidx == 0:
+        for stage in range(NUM_ACC_PIPE_STAGES):
+            cute.arch.mbarrier_arrive(acc_empty_mbar_ptr + stage)
     
     # Chunk start and tile base along T (each T tile is BC rows)
     t_start = i_t * BT
@@ -282,320 +320,313 @@ def kda_Akk_kernel(
             )
             cute.copy(tma_atom_k, tma_gK, tma_sK, tma_bar_ptr=mbar_ptr + stage)
 
-    # =============== Main loop ===============
-    # Accumulators: rmem_tensor[8] for aqk and akk (m16n16 = 2 n-tiles of m16n8k8)
-    # Index: [c00_0, c00_1, c00_2, c00_3, c01_0, c01_1, c01_2, c01_3]
-    aqk = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), cutlass.Float32)
-    akk = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), cutlass.Float32)
-    for _i in cutlass.range_constexpr(8, unroll=True):
-        aqk[_i] = cutlass.Float32(0.0)
-        akk[_i] = cutlass.Float32(0.0)
+    # =============== Warp-specialized main loop ===============
+    # Warps 0-3: TMA load + MMA compute + tree reduction (producer)
+    # Warp 4:    Dedicated writeback + inversion (consumer)
+    # Double-buffered sAccum with mbarrier pipeline for overlap.
     
-    for it in range(total_tiles):
-        stage = it % NUM_STAGES
-        phase = it // NUM_STAGES % 2
-
-        # Arrive at current stage mbarrier (thread 0 only)
-        if tidx == 0:
-            cute.arch.mbarrier_arrive(mbar_ptr + stage)
+    if warp_idx < 4:
+        # ======= Compute warps (0-3): TMA + MMA + Tree Reduction =======
+        # Accumulators: rmem_tensor[8] for aqk and akk (m16n16 = 2 n-tiles of m16n8k8)
+        aqk = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), cutlass.Float32)
+        akk = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), cutlass.Float32)
+        for _i in cutlass.range_constexpr(8, unroll=True):
+            aqk[_i] = cutlass.Float32(0.0)
+            akk[_i] = cutlass.Float32(0.0)
         
-        # Wait for current stage TMA data to be ready using mbarrier
-        cute.arch.mbarrier_wait(mbar_ptr + stage, phase)
+        for it in range(total_tiles):
+            stage = it % NUM_STAGES
+            phase = it // NUM_STAGES % 2
 
-        # Issue next TMA loads (overlapped with compute)
-        # IMPORTANT: Only warp 0 executes TMA copies
-        next_it = it + prefetch_count
-        if warp_idx == 0 and next_it < total_tiles:
-            next_stage = next_it % NUM_STAGES
-            t_sub_n = next_it // num_k_tiles
-            k_tile_n = next_it - t_sub_n * num_k_tiles
-            t_tile_idx_n = g_tile_base + t_sub_n
-            
-            # Expect bytes for next stage's mbarrier (using pointer offset)
+            # Arrive at current stage mbarrier (thread 0 only)
             if tidx == 0:
-                cute.arch.mbarrier_expect_tx(mbar_ptr + next_stage, total_tile_bytes)
+                cute.arch.mbarrier_arrive(mbar_ptr + stage)
             
-            # TMA load next g
-            gG_src_n = cute.local_tile(tma_tensor_g, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx_n, i_h, k_tile_n))
-            gG_src_2d_n = gG_src_n[(None, None, 0, 0, 0)]
-            sG_next = sG[(None, None, next_stage)]
-            tma_sG_n, tma_gG_n = cpasync.tma_partition(
-                tma_atom_g, 0, cute.make_layout(1),
-                cute.group_modes(sG_next, 0, 2),
-                cute.group_modes(gG_src_2d_n, 0, 2),
-            )
-            cute.copy(tma_atom_g, tma_gG_n, tma_sG_n, tma_bar_ptr=mbar_ptr + next_stage)
-            
-            # TMA load next q
-            gQ_src_n = cute.local_tile(tma_tensor_q, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx_n, i_h, k_tile_n))
-            gQ_src_2d_n = gQ_src_n[(None, None, 0, 0, 0)]
-            sQ_next = sQK[(None, None, next_stage * 2)]
-            tma_sQ_n, tma_gQ_n = cpasync.tma_partition(
-                tma_atom_q, 0, cute.make_layout(1),
-                cute.group_modes(sQ_next, 0, 2),
-                cute.group_modes(gQ_src_2d_n, 0, 2),
-            )
-            cute.copy(tma_atom_q, tma_gQ_n, tma_sQ_n, tma_bar_ptr=mbar_ptr + next_stage)
-            
-            # TMA load next k
-            gK_src_n = cute.local_tile(tma_tensor_k, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx_n, i_h, k_tile_n))
-            gK_src_2d_n = gK_src_n[(None, None, 0, 0, 0)]
-            sK_next = sQK[(None, None, next_stage * 2 + 1)]
-            tma_sK_n, tma_gK_n = cpasync.tma_partition(
-                tma_atom_k, 0, cute.make_layout(1),
-                cute.group_modes(sK_next, 0, 2),
-                cute.group_modes(gK_src_2d_n, 0, 2),
-            )
-            cute.copy(tma_atom_k, tma_gK_n, tma_sK_n, tma_bar_ptr=mbar_ptr + next_stage)
+            # Wait for current stage TMA data to be ready using mbarrier
+            cute.arch.mbarrier_wait(mbar_ptr + stage, phase)
 
-        # =============== Fused Element-wise + MMA using ldmatrix ===============
-        # Strategy: Use ldmatrix to load Q/K from swizzled SMEM, load G directly (no swizzle),
-        # compute element-wise in registers, then do MMA.
-        #
-        # MMA m16n8k8 layout:
-        #   - group_id = lane_id // 4 (0-7)
-        #   - tid_in_group = lane_id % 4 (0-3)
-        #   - A[16,8]: a0=A[group_id, tid*2], a1=A[group_id+8, tid*2], a2=A[group_id, tid*2+1], a3=A[group_id+8, tid*2+1]
-        #   - B[8,8]:  b0=B[group_id, tid*2], b1=B[group_id, tid*2+1]
-        #
-        # ldmatrix register mapping (from test_ldmatrix_layout.py):
-        #   - tCrA[0] -> a0, tCrA[2] -> a1, tCrA[1] -> a2, tCrA[3] -> a3
-        #   - tCrB[0] -> b0, tCrB[1] -> b1
-        #
-        # Each warp processes 2 k sub-tiles: warp0 -> k=0,1; warp1 -> k=2,3; etc.
-        
-        t_sub = it // num_k_tiles
-        k_tile = it - t_sub * num_k_tiles
-        t_abs_base = t_start + t_sub * BC
-        
-        # gn_row for normalization
-        gn_row = cutlass.min(BC // 2, cutlass.max(0, seq_len - t_abs_base - 1))
-        
-        # Thread/warp mapping for MMA
-        warp_id = tidx // 32
-        lane_id = tidx % 32
-        group_id = lane_id // 4      # 0-7, determines rows (group_id and group_id+8)
-        tid_in_group = lane_id % 4   # 0-3, determines cols within 8-col tile (tid*2 and tid*2+1)
-        k_start = warp_id * 2        # warp 0 -> k=0,1; warp 1 -> k=2,3; etc.
-        
-        # Get thread slices for ldmatrix and G copy
-        thr_mma = tiled_mma.get_slice(lane_id)
-        thr_copy_Q = tiled_copy_Q.get_slice(lane_id)
-        thr_copy_K = tiled_copy_K.get_slice(lane_id)
-        thr_copy_G = tiled_copy_G.get_slice(lane_id)
-        
-        # ========== Reset accumulators at k_tile == 0 (new t_sub) ==========
-        if k_tile == 0:
-            for _i in cutlass.range_constexpr(8, unroll=True):
-                aqk[_i] = cutlass.Float32(0.0)
-                akk[_i] = cutlass.Float32(0.0)
-        
-        # Get 2D SMEM views for current stage
-        sQ_stage = sQK[(None, None, stage * 2)]       # Q: (BC, BK)
-        sK_stage = sQK[(None, None, stage * 2 + 1)]   # K: (BC, BK)
-        sG_stage = sG[(None, None, stage)]            # G: (BC, BK)
-        
-        # ========== Fused element-wise + MMA loop using ldmatrix ==========
-        for k_iter in cutlass.range_constexpr(2, unroll=True):
-            k = k_start + k_iter
-            k_offset = k * 8  # column offset for this k sub-tile
-            col = tid_in_group * 2  # 0,2,4,6 within each 8-col tile
-            
-            # Row indices for MMA layout
-            r0 = group_id       # rows 0-7
-            r1 = group_id + 8   # rows 8-15
-            
-            # ===== Load Q tile (16x8) via ldmatrix =====
-            sQ_tile = cute.local_tile(sQ_stage, tiler=(16, 8), coord=(0, k))
-            tCsQ = thr_mma.partition_A(sQ_tile)
-            tCrQ = tiled_mma.make_fragment_A(tCsQ)
-            tCsQ_view = thr_copy_Q.partition_S(sQ_tile)
-            tCrQ_view = thr_copy_Q.retile(tCrQ)
-            cute.copy(tiled_copy_Q, tCsQ_view, tCrQ_view)
-            
-            # ===== Load K tile 0 (rows 0-7, 8x8) via ldmatrix =====
-            sK_tile_n0 = cute.local_tile(sK_stage, tiler=(8, 8), coord=(0, k))
-            tCsK_n0 = thr_mma.partition_B(sK_tile_n0)
-            tCrK_n0 = tiled_mma.make_fragment_B(tCsK_n0)
-            tCsK_n0_view = thr_copy_K.partition_S(sK_tile_n0)
-            tCrK_n0_view = thr_copy_K.retile(tCrK_n0)
-            cute.copy(tiled_copy_K, tCsK_n0_view, tCrK_n0_view)
-            
-            # ===== Load K tile 1 (rows 8-15, 8x8) via ldmatrix =====
-            sK_tile_n1 = cute.local_tile(sK_stage, tiler=(8, 8), coord=(1, k))
-            tCsK_n1 = thr_mma.partition_B(sK_tile_n1)
-            tCrK_n1 = tiled_mma.make_fragment_B(tCsK_n1)
-            tCsK_n1_view = thr_copy_K.partition_S(sK_tile_n1)
-            tCrK_n1_view = thr_copy_K.retile(tCrK_n1)
-            cute.copy(tiled_copy_K, tCsK_n1_view, tCrK_n1_view)
-            
-            # ===== Load G tile (16x8) via tiled copy: (8,4) threads, 2 vals each =====
-            gn_0 = sG_stage[(gn_row, k_offset + col)]
-            gn_1 = sG_stage[(gn_row, k_offset + col + 1)]
+            # Issue next TMA loads (overlapped with compute)
+            # IMPORTANT: Only warp 0 executes TMA copies
+            next_it = it + prefetch_count
+            if warp_idx == 0 and next_it < total_tiles:
+                next_stage = next_it % NUM_STAGES
+                t_sub_n = next_it // num_k_tiles
+                k_tile_n = next_it - t_sub_n * num_k_tiles
+                t_tile_idx_n = g_tile_base + t_sub_n
+                
+                # Expect bytes for next stage's mbarrier (using pointer offset)
+                if tidx == 0:
+                    cute.arch.mbarrier_expect_tx(mbar_ptr + next_stage, total_tile_bytes)
+                
+                # TMA load next g
+                gG_src_n = cute.local_tile(tma_tensor_g, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx_n, i_h, k_tile_n))
+                gG_src_2d_n = gG_src_n[(None, None, 0, 0, 0)]
+                sG_next = sG[(None, None, next_stage)]
+                tma_sG_n, tma_gG_n = cpasync.tma_partition(
+                    tma_atom_g, 0, cute.make_layout(1),
+                    cute.group_modes(sG_next, 0, 2),
+                    cute.group_modes(gG_src_2d_n, 0, 2),
+                )
+                cute.copy(tma_atom_g, tma_gG_n, tma_sG_n, tma_bar_ptr=mbar_ptr + next_stage)
+                
+                # TMA load next q
+                gQ_src_n = cute.local_tile(tma_tensor_q, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx_n, i_h, k_tile_n))
+                gQ_src_2d_n = gQ_src_n[(None, None, 0, 0, 0)]
+                sQ_next = sQK[(None, None, next_stage * 2)]
+                tma_sQ_n, tma_gQ_n = cpasync.tma_partition(
+                    tma_atom_q, 0, cute.make_layout(1),
+                    cute.group_modes(sQ_next, 0, 2),
+                    cute.group_modes(gQ_src_2d_n, 0, 2),
+                )
+                cute.copy(tma_atom_q, tma_gQ_n, tma_sQ_n, tma_bar_ptr=mbar_ptr + next_stage)
+                
+                # TMA load next k
+                gK_src_n = cute.local_tile(tma_tensor_k, (BC, BK, 1, 1, 1), (0, 0, t_tile_idx_n, i_h, k_tile_n))
+                gK_src_2d_n = gK_src_n[(None, None, 0, 0, 0)]
+                sK_next = sQK[(None, None, next_stage * 2 + 1)]
+                tma_sK_n, tma_gK_n = cpasync.tma_partition(
+                    tma_atom_k, 0, cute.make_layout(1),
+                    cute.group_modes(sK_next, 0, 2),
+                    cute.group_modes(gK_src_2d_n, 0, 2),
+                )
+                cute.copy(tma_atom_k, tma_gK_n, tma_sK_n, tma_bar_ptr=mbar_ptr + next_stage)
 
-            sG_tile = cute.local_tile(sG_stage, tiler=(16, 8), coord=(0, k))
-            tCsG = thr_mma.partition_C(sG_tile)
-            tCrG = tiled_mma.make_fragment_C(tCsG)
-            cute.copy(tiled_copy_G, thr_copy_G.partition_S(sG_tile), thr_copy_G.retile(tCrG))
-
-            # ===== Compute exp2 factors =====
-            # tCrG layout (MMA C/D m16n8k8):
-            #   [0] = G[group_id, tid*2]
-            #   [1] = G[group_id, tid*2+1]
-            #   [2] = G[group_id+8, tid*2]
-            #   [3] = G[group_id+8, tid*2+1]
-            b_gm_r0_0 = tCrG[0] - gn_0
-            b_gm_r0_1 = tCrG[1] - gn_1
-            b_gm_r1_0 = tCrG[2] - gn_0
-            b_gm_r1_1 = tCrG[3] - gn_1
-            
-            gq_r0_0 = cute.math.exp2(b_gm_r0_0)
-            gq_r0_1 = cute.math.exp2(b_gm_r0_1)
-            gq_r1_0 = cute.math.exp2(b_gm_r1_0)
-            gq_r1_1 = cute.math.exp2(b_gm_r1_1)
-            gk_r0_0 = cute.math.exp2(-b_gm_r0_0)
-            gk_r0_1 = cute.math.exp2(-b_gm_r0_1)
-            gk_r1_0 = cute.math.exp2(-b_gm_r1_0)
-            gk_r1_1 = cute.math.exp2(-b_gm_r1_1)
-            
-            # ===== Extract Q values from ldmatrix registers =====
-            # ldmatrix layout: tCrQ[0]->q[r0,col], tCrQ[2]->q[r1,col], tCrQ[1]->q[r0,col+1], tCrQ[3]->q[r1,col+1]
-            q_r0_0 = tCrQ[0].to(cutlass.Float32)
-            q_r1_0 = tCrQ[2].to(cutlass.Float32)
-            q_r0_1 = tCrQ[1].to(cutlass.Float32)
-            q_r1_1 = tCrQ[3].to(cutlass.Float32)
-            
-            # ===== Extract K values from ldmatrix registers =====
-            # K tile 0 (rows 0-7): tCrK_n0[0]->k[r0,col], tCrK_n0[1]->k[r0,col+1]
-            k_r0_0 = tCrK_n0[0].to(cutlass.Float32)
-            k_r0_1 = tCrK_n0[1].to(cutlass.Float32)
-            # K tile 1 (rows 8-15): tCrK_n1[0]->k[r1,col], tCrK_n1[1]->k[r1,col+1]
-            k_r1_0 = tCrK_n1[0].to(cutlass.Float32)
-            k_r1_1 = tCrK_n1[1].to(cutlass.Float32)
-            
-            # ===== Element-wise multiply for A matrices =====
-            # A for Aqk (q * gq): MMA expects a0, a1, a2, a3 order
-            a_aqk_0 = q_r0_0 * gq_r0_0  # a0: q[r0,col] * gq
-            a_aqk_1 = q_r1_0 * gq_r1_0  # a1: q[r1,col] * gq
-            a_aqk_2 = q_r0_1 * gq_r0_1  # a2: q[r0,col+1] * gq
-            a_aqk_3 = q_r1_1 * gq_r1_1  # a3: q[r1,col+1] * gq
-            
-            # A for Akk (k * gq): MMA expects a0, a1, a2, a3 order
-            a_akk_0 = k_r0_0 * gq_r0_0  # a0: k[r0,col] * gq
-            a_akk_1 = k_r1_0 * gq_r1_0  # a1: k[r1,col] * gq
-            a_akk_2 = k_r0_1 * gq_r0_1  # a2: k[r0,col+1] * gq
-            a_akk_3 = k_r1_1 * gq_r1_1  # a3: k[r1,col+1] * gq
-            
-            # ===== Element-wise multiply for B matrices (k * gk) =====
-            # B_tile_0 (rows 0-7): b0, b1
-            b0_0 = k_r0_0 * gk_r0_0  # b0: k[r0,col] * gk
-            b1_0 = k_r0_1 * gk_r0_1  # b1: k[r0,col+1] * gk
-            # B_tile_1 (rows 8-15): b0, b1
-            b0_1 = k_r1_0 * gk_r1_0  # b0: k[r1,col] * gk
-            b1_1 = k_r1_1 * gk_r1_1  # b1: k[r1,col+1] * gk
-            
-            # ===== MMA directly with computed values =====
-            # Aqk MMA: A[16,8] = q*gq, B[8,8] = k*gk (2 n-tiles for n=16)
-            aqk[0], aqk[1], aqk[2], aqk[3] = mma_tf32_m16n8k8(a_aqk_0, a_aqk_1, a_aqk_2, a_aqk_3, b0_0, b1_0, aqk[0], aqk[1], aqk[2], aqk[3])
-            aqk[4], aqk[5], aqk[6], aqk[7] = mma_tf32_m16n8k8(a_aqk_0, a_aqk_1, a_aqk_2, a_aqk_3, b0_1, b1_1, aqk[4], aqk[5], aqk[6], aqk[7])
-            # Akk MMA: A[16,8] = k*gq, B[8,8] = k*gk (reuse B tiles!)
-            akk[0], akk[1], akk[2], akk[3] = mma_tf32_m16n8k8(a_akk_0, a_akk_1, a_akk_2, a_akk_3, b0_0, b1_0, akk[0], akk[1], akk[2], akk[3])
-            akk[4], akk[5], akk[6], akk[7] = mma_tf32_m16n8k8(a_akk_0, a_akk_1, a_akk_2, a_akk_3, b0_1, b1_1, akk[4], akk[5], akk[6], akk[7])
-        
-        # 6. Tree Reduction: only after processing all k_tiles for this t_sub
-        # Uses half SMEM: only need (BC, BC*2, 2) instead of (BC, BC*4, 2)
-        # 
-        # Tree reduction strategy:
-        #   Phase 1: Warps 0,1 write to sAccum
-        #   Phase 2: Warps 2,3 load from sAccum, add to their registers
-        #   Phase 3: Warp 2 writes (warp0+warp2) to sAccum
-        #   Phase 4: Warp 3 loads, adds to get final (warp0+warp1+warp2+warp3)
-        #   Phase 5: Warp 3 writes final to sAccum
-        #   Phase 6: All warps read and write to global
-        
-        if k_tile == num_k_tiles - 1:
+            # =============== Fused Element-wise + MMA using ldmatrix ===============
+            t_sub = it // num_k_tiles
+            k_tile = it - t_sub * num_k_tiles
             t_abs_base = t_start + t_sub * BC
             
-            # ========== Phase 1: Warps 0,1 write to sAccum ==========
-            if warp_id < 2:
-                col_base = warp_id * BC  # warp 0: 0, warp 1: 16
+            # Thread/warp mapping (needed by both MMA and tree reduction)
+            warp_id = tidx // 32
+            lane_id = tidx % 32
+            group_id = lane_id // 4      # 0-7, determines rows (group_id and group_id+8)
+            tid_in_group = lane_id % 4   # 0-3, determines cols within 8-col tile (tid*2 and tid*2+1)
+            
+            # ===== MMA computation (warps 0-3) =====
+            # gn_row for normalization
+            gn_row = cutlass.min(BC // 2, cutlass.max(0, seq_len - t_abs_base - 1))
+            k_start = warp_id * 2        # warp 0 -> k=0,1; warp 1 -> k=2,3; etc.
+            
+            # Get thread slices for ldmatrix and G copy
+            thr_mma = tiled_mma.get_slice(lane_id)
+            thr_copy_Q = tiled_copy_Q.get_slice(lane_id)
+            thr_copy_K = tiled_copy_K.get_slice(lane_id)
+            thr_copy_G = tiled_copy_G.get_slice(lane_id)
+            
+            # ========== Reset accumulators at k_tile == 0 (new t_sub) ==========
+            if k_tile == 0:
                 for _i in cutlass.range_constexpr(8, unroll=True):
-                    sAccum[(group_id + _C_ROW[_i], col_base + tid_in_group * 2 + _C_COL[_i], 0)] = aqk[_i]
-                    sAccum[(group_id + _C_ROW[_i], col_base + tid_in_group * 2 + _C_COL[_i], 1)] = akk[_i]
+                    aqk[_i] = cutlass.Float32(0.0)
+                    akk[_i] = cutlass.Float32(0.0)
             
-            cute.arch.barrier()
+            # Get 2D SMEM views for current stage
+            sQ_stage = sQK[(None, None, stage * 2)]       # Q: (BC, BK)
+            sK_stage = sQK[(None, None, stage * 2 + 1)]   # K: (BC, BK)
+            sG_stage = sG[(None, None, stage)]            # G: (BC, BK)
             
-            # ========== Phase 2: Warps 2,3 load and add to registers ==========
-            # Warp 2 loads warp 0's data (cols 0-15), warp 3 loads warp 1's data (cols 16-31)
-            if warp_id >= 2:
-                partner_col_base = (warp_id - 2) * BC  # warp 2: 0, warp 3: 16
-                for _i in cutlass.range_constexpr(8, unroll=True):
-                    aqk[_i] = aqk[_i] + sAccum[(group_id + _C_ROW[_i], partner_col_base + tid_in_group * 2 + _C_COL[_i], 0)]
-                    akk[_i] = akk[_i] + sAccum[(group_id + _C_ROW[_i], partner_col_base + tid_in_group * 2 + _C_COL[_i], 1)]
-            
-            cute.arch.barrier()
-            
-            # ========== Phase 3: Warp 2 writes (warp0+warp2) to sAccum cols 0-15 ==========
-            if warp_id == 2:
-                for _i in cutlass.range_constexpr(8, unroll=True):
-                    sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], 0)] = aqk[_i]
-                    sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], 1)] = akk[_i]
-            
-            cute.arch.barrier()
-            
-            # ========== Phase 4: Warp 3 loads (warp0+warp2) and adds to get final ==========
-            if warp_id == 3:
-                for _i in cutlass.range_constexpr(8, unroll=True):
-                    aqk[_i] = aqk[_i] + sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], 0)]
-                    akk[_i] = akk[_i] + sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], 1)]
-            
-            cute.arch.barrier()
-            
-            # ========== Phase 5: Warp 3 writes Aqk to slot 0 + prepared Akk to slot 1 ==========
-            if warp_id == 3:
-                # Aqk: raw values to slot 0
-                for _i in cutlass.range_constexpr(8, unroll=True):
-                    sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], 0)] = aqk[_i]
+            # ========== Fused element-wise + MMA loop using ldmatrix ==========
+            for k_iter in cutlass.range_constexpr(2, unroll=True):
+                k = k_start + k_iter
+                k_offset = k * 8  # column offset for this k sub-tile
+                col = tid_in_group * 2  # 0,2,4,6 within each 8-col tile
                 
-                # Akk: prepare unit lower triangular (diag=1, lower=val*beta, upper=0)
-                # Branchless: prepared = val * beta * float(row > col) + float(row == col)
-                beta_r0 = cutlass.Float32(sBeta[(t_sub * BC + group_id,)])
-                beta_r1 = cutlass.Float32(sBeta[(t_sub * BC + group_id + 8,)])
-                _betas = [beta_r0, beta_r0, beta_r1, beta_r1, beta_r0, beta_r0, beta_r1, beta_r1]
-                for _i in cutlass.range_constexpr(8, unroll=True):
-                    row = group_id + _C_ROW[_i]
-                    col = tid_in_group * 2 + _C_COL[_i]
-                    sAccum[(row, col, 1)] = akk[_i] * _betas[_i] * cutlass.Float32(row > col) + cutlass.Float32(row == col)
+                # ===== Load Q tile (16x8) via ldmatrix =====
+                sQ_tile = cute.local_tile(sQ_stage, tiler=(16, 8), coord=(0, k))
+                tCsQ = thr_mma.partition_A(sQ_tile)
+                tCrQ = tiled_mma.make_fragment_A(tCsQ)
+                tCsQ_view = thr_copy_Q.partition_S(sQ_tile)
+                tCrQ_view = thr_copy_Q.retile(tCrQ)
+                cute.copy(tiled_copy_Q, tCsQ_view, tCrQ_view)
+                
+                # ===== Load K tile 0 (rows 0-7, 8x8) via ldmatrix =====
+                sK_tile_n0 = cute.local_tile(sK_stage, tiler=(8, 8), coord=(0, k))
+                tCsK_n0 = thr_mma.partition_B(sK_tile_n0)
+                tCrK_n0 = tiled_mma.make_fragment_B(tCsK_n0)
+                tCsK_n0_view = thr_copy_K.partition_S(sK_tile_n0)
+                tCrK_n0_view = thr_copy_K.retile(tCrK_n0)
+                cute.copy(tiled_copy_K, tCsK_n0_view, tCrK_n0_view)
+                
+                # ===== Load K tile 1 (rows 8-15, 8x8) via ldmatrix =====
+                sK_tile_n1 = cute.local_tile(sK_stage, tiler=(8, 8), coord=(1, k))
+                tCsK_n1 = thr_mma.partition_B(sK_tile_n1)
+                tCrK_n1 = tiled_mma.make_fragment_B(tCsK_n1)
+                tCsK_n1_view = thr_copy_K.partition_S(sK_tile_n1)
+                tCrK_n1_view = thr_copy_K.retile(tCrK_n1)
+                cute.copy(tiled_copy_K, tCsK_n1_view, tCrK_n1_view)
+                
+                # ===== Load G tile (16x8) via tiled copy: (8,4) threads, 2 vals each =====
+                gn_0 = sG_stage[(gn_row, k_offset + col)]
+                gn_1 = sG_stage[(gn_row, k_offset + col + 1)]
+
+                sG_tile = cute.local_tile(sG_stage, tiler=(16, 8), coord=(0, k))
+                tCsG = thr_mma.partition_C(sG_tile)
+                tCrG = tiled_mma.make_fragment_C(tCsG)
+                cute.copy(tiled_copy_G, thr_copy_G.partition_S(sG_tile), thr_copy_G.retile(tCrG))
+
+                # ===== Compute exp2 factors =====
+                b_gm_r0_0 = tCrG[0] - gn_0
+                b_gm_r0_1 = tCrG[1] - gn_1
+                b_gm_r1_0 = tCrG[2] - gn_0
+                b_gm_r1_1 = tCrG[3] - gn_1
+                
+                gq_r0_0 = cute.math.exp2(b_gm_r0_0)
+                gq_r0_1 = cute.math.exp2(b_gm_r0_1)
+                gq_r1_0 = cute.math.exp2(b_gm_r1_0)
+                gq_r1_1 = cute.math.exp2(b_gm_r1_1)
+                gk_r0_0 = cute.math.exp2(-b_gm_r0_0)
+                gk_r0_1 = cute.math.exp2(-b_gm_r0_1)
+                gk_r1_0 = cute.math.exp2(-b_gm_r1_0)
+                gk_r1_1 = cute.math.exp2(-b_gm_r1_1)
+                
+                # ===== Extract Q values from ldmatrix registers =====
+                q_r0_0 = tCrQ[0].to(cutlass.Float32)
+                q_r1_0 = tCrQ[2].to(cutlass.Float32)
+                q_r0_1 = tCrQ[1].to(cutlass.Float32)
+                q_r1_1 = tCrQ[3].to(cutlass.Float32)
+                
+                # ===== Extract K values from ldmatrix registers =====
+                k_r0_0 = tCrK_n0[0].to(cutlass.Float32)
+                k_r0_1 = tCrK_n0[1].to(cutlass.Float32)
+                k_r1_0 = tCrK_n1[0].to(cutlass.Float32)
+                k_r1_1 = tCrK_n1[1].to(cutlass.Float32)
+                
+                # ===== Element-wise multiply for A matrices =====
+                a_aqk_0 = q_r0_0 * gq_r0_0
+                a_aqk_1 = q_r1_0 * gq_r1_0
+                a_aqk_2 = q_r0_1 * gq_r0_1
+                a_aqk_3 = q_r1_1 * gq_r1_1
+                
+                a_akk_0 = k_r0_0 * gq_r0_0
+                a_akk_1 = k_r1_0 * gq_r1_0
+                a_akk_2 = k_r0_1 * gq_r0_1
+                a_akk_3 = k_r1_1 * gq_r1_1
+                
+                # ===== Element-wise multiply for B matrices (k * gk) =====
+                b0_0 = k_r0_0 * gk_r0_0
+                b1_0 = k_r0_1 * gk_r0_1
+                b0_1 = k_r1_0 * gk_r1_0
+                b1_1 = k_r1_1 * gk_r1_1
+                
+                # ===== MMA directly with computed values =====
+                aqk[0], aqk[1], aqk[2], aqk[3] = mma_tf32_m16n8k8(a_aqk_0, a_aqk_1, a_aqk_2, a_aqk_3, b0_0, b1_0, aqk[0], aqk[1], aqk[2], aqk[3])
+                aqk[4], aqk[5], aqk[6], aqk[7] = mma_tf32_m16n8k8(a_aqk_0, a_aqk_1, a_aqk_2, a_aqk_3, b0_1, b1_1, aqk[4], aqk[5], aqk[6], aqk[7])
+                akk[0], akk[1], akk[2], akk[3] = mma_tf32_m16n8k8(a_akk_0, a_akk_1, a_akk_2, a_akk_3, b0_0, b1_0, akk[0], akk[1], akk[2], akk[3])
+                akk[4], akk[5], akk[6], akk[7] = mma_tf32_m16n8k8(a_akk_0, a_akk_1, a_akk_2, a_akk_3, b0_1, b1_1, akk[4], akk[5], akk[6], akk[7])
             
-            cute.arch.barrier()
+            # =============== Tree Reduction + Pipeline Signal ===============
+            # Only after processing all k_tiles for this t_sub.
+            # Uses double-buffered sAccum: buf = t_sub % NUM_ACC_PIPE_STAGES
+            # Warps 0-3 sync via compute_warp_barrier (bar.sync 2, 128).
+            # After Phase 5, warp 3 signals acc_full -> warp 4 can consume.
+            # Before Phase 1, warps 0-3 wait acc_empty -> buffer is free.
             
-            # ========== Phase 6a: Write Aqk from slot 0 to global ==========
-            for local_row in cutlass.range_constexpr(4, unroll=True):
-                row = warp_id * 4 + local_row
-                if lane_id < 16:
-                    col = lane_id
-                    final_aqk = sAccum[(row, col, 0)]
+            if k_tile == num_k_tiles - 1:
+                t_abs_base = t_start + t_sub * BC
+                
+                # Double-buffer index for sAccum pipeline
+                acc_buf = t_sub % NUM_ACC_PIPE_STAGES
+                acc_pipe_phase = (t_sub // NUM_ACC_PIPE_STAGES) % 2
+                aqk_slot = acc_buf * 2        # Aqk slot in sAccum dim-2
+                akk_slot = acc_buf * 2 + 1    # Akk slot in sAccum dim-2
+                
+                # Wait for buffer to be free (warp 4 done with this buffer)
+                cute.arch.mbarrier_wait(acc_empty_mbar_ptr + acc_buf, acc_pipe_phase)
+                
+                # ========== Phase 1: Warps 0,1 write to sAccum ==========
+                if warp_id < 2:
+                    col_base = warp_id * BC  # warp 0: 0, warp 1: 16
+                    for _i in cutlass.range_constexpr(8, unroll=True):
+                        sAccum[(group_id + _C_ROW[_i], col_base + tid_in_group * 2 + _C_COL[_i], aqk_slot)] = aqk[_i]
+                        sAccum[(group_id + _C_ROW[_i], col_base + tid_in_group * 2 + _C_COL[_i], akk_slot)] = akk[_i]
+                
+                compute_warp_barrier()
+                
+                # ========== Phase 2: Warps 2,3 load and add to registers ==========
+                if warp_id >= 2:
+                    if warp_id < 4:
+                        partner_col_base = (warp_id - 2) * BC
+                        for _i in cutlass.range_constexpr(8, unroll=True):
+                            aqk[_i] = aqk[_i] + sAccum[(group_id + _C_ROW[_i], partner_col_base + tid_in_group * 2 + _C_COL[_i], aqk_slot)]
+                            akk[_i] = akk[_i] + sAccum[(group_id + _C_ROW[_i], partner_col_base + tid_in_group * 2 + _C_COL[_i], akk_slot)]
+                
+                compute_warp_barrier()
+                
+                # ========== Phase 3: Warp 2 writes (warp0+warp2) to sAccum cols 0-15 ==========
+                if warp_id == 2:
+                    for _i in cutlass.range_constexpr(8, unroll=True):
+                        sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], aqk_slot)] = aqk[_i]
+                        sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], akk_slot)] = akk[_i]
+                
+                compute_warp_barrier()
+                
+                # ========== Phase 4: Warp 3 loads (warp0+warp2) and adds to get final ==========
+                if warp_id == 3:
+                    for _i in cutlass.range_constexpr(8, unroll=True):
+                        aqk[_i] = aqk[_i] + sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], aqk_slot)]
+                        akk[_i] = akk[_i] + sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], akk_slot)]
+                
+                compute_warp_barrier()
+                
+                # ========== Phase 5: Warp 3 writes Aqk + prepared Akk to sAccum ==========
+                if warp_id == 3:
+                    # Aqk: raw values to aqk_slot
+                    for _i in cutlass.range_constexpr(8, unroll=True):
+                        sAccum[(group_id + _C_ROW[_i], tid_in_group * 2 + _C_COL[_i], aqk_slot)] = aqk[_i]
+                    
+                    # Akk: prepare unit lower triangular (diag=1, lower=val*beta, upper=0)
+                    beta_r0 = cutlass.Float32(sBeta[(t_sub * BC + group_id,)])
+                    beta_r1 = cutlass.Float32(sBeta[(t_sub * BC + group_id + 8,)])
+                    _betas = [beta_r0, beta_r0, beta_r1, beta_r1, beta_r0, beta_r0, beta_r1, beta_r1]
+                    for _i in cutlass.range_constexpr(8, unroll=True):
+                        row = group_id + _C_ROW[_i]
+                        col = tid_in_group * 2 + _C_COL[_i]
+                        sAccum[(row, col, akk_slot)] = akk[_i] * _betas[_i] * cutlass.Float32(row > col) + cutlass.Float32(row == col)
+                    
+                    # Signal warp 4: data is ready in this buffer
+                    # mbarrier_arrive includes release fence for this thread's writes
+                    cute.arch.mbarrier_arrive(acc_full_mbar_ptr + acc_buf)
+    
+    else:
+        # ======= Warp 4: Dedicated writeback + inversion (pipelined) =======
+        # Warp 4 has its own independent loop over t_sub values.
+        # It waits for acc_full (data ready), does writeback + inversion,
+        # then signals acc_empty (buffer free) so compute warps can reuse.
+        lane_id_w4 = tidx % 32
+        
+        for t_sub_w4 in range(num_t_tiles):
+            acc_buf = t_sub_w4 % NUM_ACC_PIPE_STAGES
+            acc_pipe_phase = (t_sub_w4 // NUM_ACC_PIPE_STAGES) % 2
+            t_abs_base = t_start + t_sub_w4 * BC
+            aqk_slot = acc_buf * 2
+            akk_slot = acc_buf * 2 + 1
+            
+            # Wait for compute warps to produce data in this buffer
+            cute.arch.mbarrier_wait(acc_full_mbar_ptr + acc_buf, acc_pipe_phase)
+            
+            # ========== Phase 6a: Write Aqk from sAccum to global ==========
+            for local_row in cutlass.range_constexpr(BC, unroll=True):
+                row = local_row
+                if lane_id_w4 < BC:
+                    col = lane_id_w4
+                    final_aqk = sAccum[(row, col, aqk_slot)]
                     val_aqk_out = cutlass.Float32(0.0)
                     if row >= col:
                         val_aqk_out = final_aqk * scale
-                    Aqk_tensor[(i_b, t_abs_base + row, i_h, t_sub * BC + col)] = cutlass.Float16(val_aqk_out)
+                    Aqk_tensor[(i_b, t_abs_base + row, i_h, t_sub_w4 * BC + col)] = cutlass.Float16(val_aqk_out)
             
-            cute.arch.barrier()
+            # ========== Phase 6b: Invert 16x16 Akk (akk_slot -> aqk_slot) ==========
+            _invert_16x16_halfwarp_fp32(sAccum[(None, None, akk_slot)], sAccum[(None, None, aqk_slot)], 0, lane_id_w4)
             
-            # ========== Phase 6b: Warp 0 inverts 16x16 Akk (slot 1 -> slot 0) ==========
-            if warp_id == 0:
-                _invert_16x16_halfwarp_fp32(sAccum[(None, None, 1)], sAccum[(None, None, 0)], 0, lane_id)
+            # ========== Phase 6c: Write inverted Akk from sAccum to global ==========
+            for local_row in cutlass.range_constexpr(BC, unroll=True):
+                row = local_row
+                if lane_id_w4 < BC:
+                    col = lane_id_w4
+                    Akk_tensor[(i_b, t_abs_base + row, i_h, col)] = sAccum[(row, col, aqk_slot)]
             
-            cute.arch.barrier()
-            
-            # ========== Phase 6c: Write inverted Akk from slot 0 to global ==========
-            for local_row in cutlass.range_constexpr(4, unroll=True):
-                row = warp_id * 4 + local_row
-                if lane_id < 16:
-                    col = lane_id
-                    Akk_tensor[(i_b, t_abs_base + row, i_h, col)] = sAccum[(row, col, 0)]
-
-        cute.arch.barrier()
+            # Signal compute warps: this buffer is now free to reuse
+            if lane_id_w4 == 0:
+                cute.arch.mbarrier_arrive(acc_empty_mbar_ptr + acc_buf)
 
 
 @cute.jit
@@ -709,12 +740,13 @@ def run_kda_Akk(
     # g/q/k use swizzle layouts defined above (g_smem_layout_swizzle, qk_smem_layout_swizzle)
     # Only need to define accum and beta layouts here
     
-    # accum: (BC, BC * 2, 2) for Aqk (slot 0) and Akk (slot 1)
-    # With tree reduction, only need space for 2 warps
+    # accum: (BC, BC * 2, NUM_ACC_PIPE_STAGES * 2)
+    # Double-buffered: buf 0 has slots (0,1) = (Aqk, Akk), buf 1 has slots (2,3) = (Aqk, Akk)
     # Add 8-col padding to avoid bank conflict
     ACCUM_PAD = 8
+    num_accum_slots = NUM_ACC_PIPE_STAGES * 2  # 4 slots total
     accum_smem_layout = cute.make_layout(
-        (BC, BC * 2, 2),
+        (BC, BC * 2, num_accum_slots),
         stride=(BC * 2 + ACCUM_PAD, 1, BC * (BC * 2 + ACCUM_PAD))
     )
 
@@ -727,14 +759,14 @@ def run_kda_Akk(
     # SMEM size calculation
     # g: 16 * 64 * NUM_STAGES * 4 bytes (with swizzle)
     # qk (fp16): 16 * 64 * (NUM_STAGES * 2) * 2 bytes for q and k interleaved (with swizzle)
-    # accum: (BC, BC*2+8, 2) = 16 * 40 * 2 * 4 bytes (8-col padding)
+    # accum: (BC, BC*2+8, num_accum_slots) * 4 bytes (8-col padding, double buffered)
     # beta: BT * 2 bytes
-    # mbarrier: 8 bytes per barrier * NUM_STAGES
+    # mbarrier: 8 bytes per barrier * (NUM_STAGES + 2 * NUM_ACC_PIPE_STAGES)
     smem_bytes = (4 * BC * BK * NUM_STAGES +                     # sG (float32, swizzled)
                   2 * BC * BK * NUM_STAGES * 2 +                 # sQK (fp16, swizzled, interleaved q/k)
-                  4 * BC * (BC * 2 + ACCUM_PAD) * 2 +            # sAccum (8-col padding)
+                  4 * BC * (BC * 2 + ACCUM_PAD) * num_accum_slots + # sAccum (double-buffered)
                   2 * BT +                                        # sBeta
-                  8 * NUM_STAGES +                                # mbarriers
+                  8 * (NUM_STAGES + 2 * NUM_ACC_PIPE_STAGES) +   # mbarriers (TMA + acc pipeline)
                   256)                                            # alignment
     
     print(f"KDA Akk: B={B}, T={seq_len}, H={H}, K={K}")
