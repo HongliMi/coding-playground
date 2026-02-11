@@ -187,6 +187,7 @@ def kda_Akk_kernel(
     tiled_copy_Q: cute.TiledCopy, # ldmatrix for Q (16x8)
     tiled_copy_K: cute.TiledCopy, # ldmatrix for K (8x8)
     tiled_copy_G: cute.TiledCopy, # s2r for G (16x8), MMA C layout: (8,4) threads, 2 vals each
+    tiled_copy_Gn: cute.TiledCopy, # s2r for Gn (1x8), 4 threads, 2 vals each
     BT: cutlass.Constexpr[int],
     num_k_tiles: cutlass.Constexpr[int],
     seq_len: int,                # sequence length
@@ -412,6 +413,7 @@ def kda_Akk_kernel(
             thr_copy_Q = tiled_copy_Q.get_slice(lane_id)
             thr_copy_K = tiled_copy_K.get_slice(lane_id)
             thr_copy_G = tiled_copy_G.get_slice(lane_id)
+            thr_copy_Gn = tiled_copy_Gn.get_slice(tid_in_group)
             
             # ========== Reset accumulators at k_tile == 0 (new t_sub) ==========
             if k_tile == 0:
@@ -454,10 +456,15 @@ def kda_Akk_kernel(
                 tCrK_n1_view = thr_copy_K.retile(tCrK_n1)
                 cute.copy(tiled_copy_K, tCsK_n1_view, tCrK_n1_view)
                 
-                # ===== Load G tile (16x8) via tiled copy: (8,4) threads, 2 vals each =====
-                gn_0 = sG_stage[(gn_row, k_offset + col)]
-                gn_1 = sG_stage[(gn_row, k_offset + col + 1)]
+                # ===== Load Gn tile (1x8) for normalization row via tiled copy =====
+                sGn_tile = cute.local_tile(sG_stage, tiler=(1, 8), coord=(gn_row, k))
+                tCsGn = thr_copy_Gn.partition_S(sGn_tile)
+                tCrGn = cute.make_fragment_like(tCsGn, cutlass.Float32)
+                cute.copy(tiled_copy_Gn, tCsGn, thr_copy_Gn.retile(tCrGn))
+                gn_0 = tCrGn[0]
+                gn_1 = tCrGn[1]
 
+                # ===== Load G tile (16x8) via tiled copy: (8,4) threads, 2 vals each =====
                 sG_tile = cute.local_tile(sG_stage, tiler=(16, 8), coord=(0, k))
                 tCsG = thr_mma.partition_C(sG_tile)
                 tCrG = tiled_mma.make_fragment_C(tCsG)
@@ -736,6 +743,18 @@ def run_kda_Akk(
     )
     tiled_copy_G_s2r = cute.make_tiled_copy_C(copy_atom_G_s2r, tiled_mma)
     
+    # TiledCopy for Gn: load 1 row of 8 Float32 from SMEM, 4 threads x 2 vals each
+    copy_atom_Gn_s2r = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(),
+        cutlass.Float32,
+        num_bits_per_copy=64  # 2 x Float32 = 64 bits
+    )
+    tiled_copy_Gn_s2r = cute.make_tiled_copy_tv(
+        copy_atom_Gn_s2r,
+        thr_layout=cute.make_layout((1, 4)),  # 1 row, 4 threads along cols
+        val_layout=cute.make_layout((1, 2))   # 1 row, 2 values per thread along cols
+    )
+    
     # =============== SMEM layouts ===============
     # g/q/k use swizzle layouts defined above (g_smem_layout_swizzle, qk_smem_layout_swizzle)
     # Only need to define accum and beta layouts here
@@ -791,6 +810,7 @@ def run_kda_Akk(
         tiled_copy_Q,        # ldmatrix for Q
         tiled_copy_K,        # ldmatrix for K
         tiled_copy_G_s2r,    # s2r for G matching MMA C layout
+        tiled_copy_Gn_s2r,   # s2r for Gn row (1x8), 4 threads x 2 vals
         BT,
         num_k_tiles,
         seq_len,
