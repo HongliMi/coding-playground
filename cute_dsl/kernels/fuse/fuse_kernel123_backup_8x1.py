@@ -155,6 +155,20 @@ def mma_tf32_m16n8k8(
     return d0, d1, d2, d3
 
 
+@dsl_user_op
+def read_clock64(*, loc=None, ip=None):
+    """Read GPU cycle counter (%clock64)"""
+    result = llvm.inline_asm(
+        T.i64(), [],
+        "mov.u64 $0, %clock64;",
+        "=l",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return cutlass.Int64(result)
+
+
+NUM_PROFILE_SLOTS = 8
 SHFL_W8_CLAMP = 0x1800  # shfl width=8: segmask=0x18 in bits[12:8], max LaneId=0 in bits[4:0]
 
 
@@ -179,6 +193,7 @@ def fused_kernel123(
     qk_smem_layout,               # (BT, K_DIM, NUM_STAGES) swizzled
     g_smem_layout,                # (BT, K_DIM, NUM_STAGES) row-major
     g_cumsum_layout,
+    mProfile: cute.Tensor,         # [8] int64, cycle profiling
     num_chunks: int,
 ):
     i_cg, i_h, i_b = cute.arch.block_idx()
@@ -186,6 +201,8 @@ def fused_kernel123(
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
     lane_id = tidx % 32
+
+    is_first_block = (i_cg == 0) & (i_h == 0) & (i_b == 0)
 
     chunk_base = i_cg * CHUNKS_PER_BLOCK
 
@@ -260,6 +277,7 @@ def fused_kernel123(
     # Warp 0: TMA Producer
     # =================================================================
     if warp_idx == 0:
+        t_tma_start = read_clock64()
         for chunk_iter in cutlass.range_constexpr(CHUNKS_PER_BLOCK):
             s = chunk_iter % NUM_STAGES
             phase = chunk_iter // NUM_STAGES % 2
@@ -292,6 +310,11 @@ def fused_kernel123(
             if lane_id == 0:
                 cute.arch.mbarrier_arrive(tma_mbars + s)
 
+        t_tma_end = read_clock64()
+        if is_first_block and lane_id == 0:
+            mProfile[0] = t_tma_start
+            mProfile[1] = t_tma_end
+
     # =================================================================
     # Warps 1-8: K1 gate activation + cumsum + scaling (8×1 layout)
     #
@@ -310,6 +333,7 @@ def fused_kernel123(
     # Cross-warp prefix: 8 row-warps (single col group)
     # =================================================================
     if warp_idx >= 1 and warp_idx < 1 + NUM_K1_WARPS:
+        t_k1_start = read_clock64()
         k1_warp = warp_idx - 1
         warp_row_group = k1_warp % K1_ROW_GROUPS   # 0..7
         warp_col_group = k1_warp // K1_ROW_GROUPS   # always 0 (single col group)
@@ -455,12 +479,18 @@ def fused_kernel123(
             # Signal g_cumsum ready for MMA warps
             cute.arch.mbarrier_arrive(k1_done_mbars + s)
 
+        t_k1_end = read_clock64()
+        if is_first_block and warp_idx == 1 and lane_id == 0:
+            mProfile[2] = t_k1_start
+            mProfile[3] = t_k1_end
+
     # =================================================================
     # Warps 9-12: Store/Inversion warps
     # Wait for MMA warps to fill sAqk/sAkk, then write to GMEM.
     # TODO: add block inversion for A_kk
     # =================================================================
     if warp_idx >= 1 + NUM_K1_WARPS and warp_idx < 1 + NUM_K1_WARPS + NUM_STORE_WARPS:
+        t_store_start = read_clock64()
         store_warp = warp_idx - (1 + NUM_K1_WARPS)
 
         for chunk_iter in cutlass.range_constexpr(CHUNKS_PER_BLOCK):
@@ -503,6 +533,11 @@ def fused_kernel123(
             # Signal sAqk/sAkk stage is free for MMA to reuse
             cute.arch.mbarrier_arrive(store_done_mbars + s)
 
+        t_store_end = read_clock64()
+        if is_first_block and warp_idx == (1 + NUM_K1_WARPS) and lane_id == 0:
+            mProfile[4] = t_store_start
+            mProfile[5] = t_store_end
+
     # =================================================================
     # Warps 13-22: K2+K3 MMA Compute (10 warps = 10 lower-tri tiles)
     #
@@ -523,6 +558,7 @@ def fused_kernel123(
     #   A_kk[i_q,i_k] = beta  * Kq_gated[i_q] @ K_gated[i_k]^T
     # =================================================================
     if warp_idx >= 1 + NUM_K1_WARPS + NUM_STORE_WARPS:
+        t_mma_start = read_clock64()
         mma_warp = warp_idx - (1 + NUM_K1_WARPS + NUM_STORE_WARPS)  # 0..9
 
         # Decode (i_q, i_k) from mma_warp (fixed per warp, computed once)
@@ -678,6 +714,11 @@ def fused_kernel123(
             cute.arch.mbarrier_arrive(mma_done_mbars + s)
             cute.arch.mbarrier_arrive(store_stage_mbars + s)
 
+        t_mma_end = read_clock64()
+        if is_first_block and warp_idx == (1 + NUM_K1_WARPS + NUM_STORE_WARPS) and lane_id == 0:
+            mProfile[6] = t_mma_start
+            mProfile[7] = t_mma_end
+
 
 # =========================================================================
 # Host function
@@ -694,7 +735,8 @@ def make_host_function(B, NT, H):
 
     @cute.jit
     def host_fn(mQ, mK, mG, mA_log, mBeta, scale,
-                mKscaled, mKg, mQscaled, mGkLast, mAqk, mAkk):
+                mKscaled, mKg, mQscaled, mGkLast, mAqk, mAkk,
+                mProfile):
         view_layout = cute.make_layout(
             (BT, K_DIM, _BNT, _H),
             stride=(s_row, s_col, s_bnt, s_h),
@@ -782,7 +824,8 @@ def make_host_function(B, NT, H):
             mKscaled_v2, mKg_v2, mQscaled_v2, mGkLast_v2, mAqk, mAkk,
             tiled_copy_qk_s2r,
             tiled_mma_k2, tiled_copy_mma_A, tiled_copy_mma_B,
-            qk_smem_3d, g_smem_3d, g_cumsum_layout, _NT,
+            qk_smem_3d, g_smem_3d, g_cumsum_layout,
+            mProfile, _NT,
         ).launch(
             grid=(_NT // CHUNKS_PER_BLOCK, _H, _B),
             # grid=(1, 1, 1),
@@ -856,32 +899,56 @@ def test():
     mAqk = _ct(A_qk, cutlass.BFloat16)
     mAkk = _ct(A_kk, cutlass.BFloat16)
 
+    profile = torch.zeros(NUM_PROFILE_SLOTS, device="cuda", dtype=torch.int64)
+    mProfile = _ct(profile, cutlass.Int64)
+
     print("Compiling...")
     compiled = cute.compile[KeepPTX, KeepCUBIN](
         host_fn,
         mQ, mK, mG, mA_log, mBeta, scale,
         mKscaled, mKg, mQscaled, mGkLast, mAqk, mAkk,
+        mProfile,
     )
 
     print("Running...")
     compiled(mQ, mK, mG, mA_log, mBeta, scale,
-             mKscaled, mKg, mQscaled, mGkLast, mAqk, mAkk)
+             mKscaled, mKg, mQscaled, mGkLast, mAqk, mAkk,
+             mProfile)
     torch.cuda.synchronize()
     print("Kernel executed successfully!")
 
     # TODO: correctness checks against reference K1+K2+K3
 
+    # --- Cycle profiling readback ---
+    p = profile.cpu().tolist()
+    labels = ["TMA (warp 0)", "K1  (warps 1-8)", "Store (warps 9-12)", "MMA (warps 13-22)"]
+    print("\n--- Cycle Profiling (block 0) ---")
+    all_starts, all_ends = [], []
+    for i, label in enumerate(labels):
+        t_start, t_end = p[2*i], p[2*i+1]
+        dur = t_end - t_start
+        print(f"  {label:25s}  {dur:>12,} cycles  (abs: {t_start} → {t_end})")
+        if t_start > 0:
+            all_starts.append(t_start)
+            all_ends.append(t_end)
+    if all_starts:
+        wall = max(all_ends) - min(all_starts)
+        print(f"  {'Wall (min start→max end)':25s}  {wall:>12,} cycles  (abs: {min(all_starts)} → {max(all_ends)})")
+    print()
+
     num_warmup, num_iters = 20, 100
 
     for _ in range(num_warmup):
         compiled(mQ, mK, mG, mA_log, mBeta, scale,
-                 mKscaled, mKg, mQscaled, mGkLast, mAqk, mAkk)
+                 mKscaled, mKg, mQscaled, mGkLast, mAqk, mAkk,
+                 mProfile)
     torch.cuda.synchronize()
 
     start = time.perf_counter()
     for _ in range(num_iters):
         compiled(mQ, mK, mG, mA_log, mBeta, scale,
-                 mKscaled, mKg, mQscaled, mGkLast, mAqk, mAkk)
+                 mKscaled, mKg, mQscaled, mGkLast, mAqk, mAkk,
+                 mProfile)
     torch.cuda.synchronize()
     elapsed_us = (time.perf_counter() - start) / num_iters * 1e6
 

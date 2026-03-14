@@ -8,6 +8,9 @@
 *.nsys-analysis
 *.sqlite
 *.sqlite3
+*.cubin
+*.ptx
+*.sass
 
 # ---- Profiling / traces (repo-local) ----
 **/profiler_traces/
