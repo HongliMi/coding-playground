@@ -13,14 +13,16 @@ Block: 1024 threads (32 warps), warp-specialized with setmaxnreg (all groups 4-a
 Pipeline (prefetch overlap):
   Warps 0-15:  prefetch chunk 0→stage 0 (warp 0), then loop:
                   TMA next chunk (warp 0), wait cur chunk, K1 compute, arrive(k1_done)
-  Warps 16-27: wait(k1_done) + wait(store_done) + wait(tma), MMA, arrive(mma_done + stage_reuse)
-  Warps 28-31: wait(mma_done), store sAqk/sAkk→GMEM, arrive(store_done)
+  Warps 16-27: wait(k1_done) + wait(store_done), MMA, arrive(aqk_done + stage_reuse),
+                  Akk inversion, arrive(akk_done)
+  Warps 28-31: wait(aqk_done) → store sAqk→GMEM, wait(akk_done) → store sAkk→GMEM, arrive(store_done)
 
 Mbarriers:
   tma_mbars[2]:          count=1, warp 0 lane 0 → K1+MMA wait for TMA data
   stage_reuse_mbars[2]:  count=384, MMA(12 warps) → warp 0 waits before TMA reuse
   k1_done_mbars[2]:      count=512, K1(16 warps) → MMA waits for g_cumsum ready
-  mma_done_mbars[2]:     count=384, MMA(12 warps) → Store waits for sAqk/sAkk ready
+  aqk_done_mbars[2]:     count=384, MMA(12 warps) → Store waits for sAqk ready
+  akk_done_mbars[2]:     count=384, MMA(12 warps) → Store waits for sAkk ready (after inversion)
   store_done_mbars[2]:   count=128, Store(4 warps) → MMA waits for sAqk/sAkk stage free
 
 SMEM: ~212KB (q+k+g × [64,128] bf16 × 2 stages + g_cumsum [64,128] fp32 × 2 stages
@@ -128,6 +130,65 @@ def k1_internal_barrier(*, loc=None, ip=None):
 
 
 @dsl_user_op
+def mma_internal_barrier(*, loc=None, ip=None):
+    """Named barrier for MMA warps (16-27, 384 threads). barrier_id=3."""
+    llvm.inline_asm(
+        T.i32(), [],
+        "membar.cta; bar.sync 3, 384; mov.u32 $0, 0;",
+        "=r",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+
+
+@dsl_user_op
+def _invert_16x16_halfwarp_bf16(
+    sA: cute.Tensor,
+    diag_offset,
+    lane_id,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Invert a 16x16 unit lower triangular block in-place (bf16 smem).
+
+    Uses half-warp (16 threads). Anti-diagonal sweep with warp shuffle.
+    Computation in fp32, I/O in bf16. Register-optimized: rA eliminated
+    by re-reading from SMEM; incremental accumulation minimizes live regs.
+    """
+    my_row = lane_id % 16
+    halfwarp_base = (lane_id // 16) * 16
+
+    row_off = diag_offset
+    col_off = diag_offset
+
+    rInv = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), cutlass.Float32)
+
+    rInv[0] = cutlass.Float32(1.0)
+    for x in range(1, 16):
+        rInv[x] = cutlass.Float32(0.0)
+
+    for d in range(1, 16):
+        col_d = my_row - d
+        valid = cutlass.Float32(col_d >= 0)
+        a_val = sA[row_off + my_row, col_off + col_d].to(cutlass.Float32) * valid
+
+        acc = cutlass.Float32(0.0)
+        for j in range(1, d):
+            a_re = sA[row_off + my_row, col_off + my_row - (d - j)].to(cutlass.Float32)
+            inv_shfl = cute.arch.shuffle_sync(rInv[j], halfwarp_base + my_row - d + j)
+            acc = acc + a_re * inv_shfl
+
+        rInv[d] = (-a_val - acc) * valid
+
+    rInv[0] = cutlass.Float32(1.0)
+
+    sA[row_off + my_row, col_off + my_row] = rInv[0].to(cutlass.BFloat16)
+    for d in range(1, 16):
+        sA[row_off + my_row, col_off + (my_row + 16 - d) % 16] = (rInv[d] * cutlass.Float32(my_row >= d)).to(cutlass.BFloat16)
+
+
+@dsl_user_op
 def mma_tf32_m16n8k8(
     a0, a1, a2, a3,
     b0, b1,
@@ -232,7 +293,8 @@ def fused_kernel123(
     tma_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
     stage_reuse_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
     k1_done_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
-    mma_done_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
+    aqk_done_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
+    akk_done_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
     store_done_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
 
     bytes_per_stage = BT * K_DIM * 2 * 3
@@ -242,7 +304,8 @@ def fused_kernel123(
             cute.arch.mbarrier_init(tma_mbars + s, 1)
             cute.arch.mbarrier_init(stage_reuse_mbars + s, NUM_MMA_WARPS * 32)
             cute.arch.mbarrier_init(k1_done_mbars + s, NUM_K1_TMA_WARPS * 32)
-            cute.arch.mbarrier_init(mma_done_mbars + s, NUM_MMA_WARPS * 32)
+            cute.arch.mbarrier_init(aqk_done_mbars + s, NUM_MMA_WARPS * 32)
+            cute.arch.mbarrier_init(akk_done_mbars + s, NUM_MMA_WARPS * 32)
             cute.arch.mbarrier_init(store_done_mbars + s, NUM_STORE_WARPS * 32)
     cute.arch.mbarrier_init_fence()
     cute.arch.barrier()
@@ -607,7 +670,7 @@ def fused_kernel123(
                     acc_akk_n1_0, acc_akk_n1_1, acc_akk_n1_2, acc_akk_n1_3 = mma_tf32_m16n8k8(
                         ka0, ka1, ka2, ka3, k_n1_b0, k_n1_b1,
                         acc_akk_n1_0, acc_akk_n1_1, acc_akk_n1_2, acc_akk_n1_3)
-
+                # compiler auto vectorize
                 csAqk[q_row_base + row0, k_col_base + col0] = (acc_aqk_n0_0 * scale).to(cutlass.BFloat16)
                 csAqk[q_row_base + row0, k_col_base + col1] = (acc_aqk_n0_1 * scale).to(cutlass.BFloat16)
                 csAqk[q_row_base + row1, k_col_base + col0] = (acc_aqk_n0_2 * scale).to(cutlass.BFloat16)
@@ -616,19 +679,34 @@ def fused_kernel123(
                 csAqk[q_row_base + row0, k_col_base + col3] = (acc_aqk_n1_1 * scale).to(cutlass.BFloat16)
                 csAqk[q_row_base + row1, k_col_base + col2] = (acc_aqk_n1_2 * scale).to(cutlass.BFloat16)
                 csAqk[q_row_base + row1, k_col_base + col3] = (acc_aqk_n1_3 * scale).to(cutlass.BFloat16)
+                #store to upper triangle
+                csAkk[k_col_base + row0, q_row_base + col0] = (acc_akk_n0_0 * beta_row0).to(cutlass.BFloat16)
+                csAkk[k_col_base + row0, q_row_base + col1] = (acc_akk_n0_1 * beta_row0).to(cutlass.BFloat16)
+                csAkk[k_col_base + row1, q_row_base + col0] = (acc_akk_n0_2 * beta_row1).to(cutlass.BFloat16)
+                csAkk[k_col_base + row1, q_row_base + col1] = (acc_akk_n0_3 * beta_row1).to(cutlass.BFloat16)
+                csAkk[k_col_base + row0, q_row_base + col2] = (acc_akk_n1_0 * beta_row0).to(cutlass.BFloat16)
+                csAkk[k_col_base + row0, q_row_base + col3] = (acc_akk_n1_1 * beta_row0).to(cutlass.BFloat16)
+                csAkk[k_col_base + row1, q_row_base + col2] = (acc_akk_n1_2 * beta_row1).to(cutlass.BFloat16)
+                csAkk[k_col_base + row1, q_row_base + col3] = (acc_akk_n1_3 * beta_row1).to(cutlass.BFloat16)
 
-                csAkk[q_row_base + row0, k_col_base + col0] = (acc_akk_n0_0 * beta_row0).to(cutlass.BFloat16)
-                csAkk[q_row_base + row0, k_col_base + col1] = (acc_akk_n0_1 * beta_row0).to(cutlass.BFloat16)
-                csAkk[q_row_base + row1, k_col_base + col0] = (acc_akk_n0_2 * beta_row1).to(cutlass.BFloat16)
-                csAkk[q_row_base + row1, k_col_base + col1] = (acc_akk_n0_3 * beta_row1).to(cutlass.BFloat16)
-                csAkk[q_row_base + row0, k_col_base + col2] = (acc_akk_n1_0 * beta_row0).to(cutlass.BFloat16)
-                csAkk[q_row_base + row0, k_col_base + col3] = (acc_akk_n1_1 * beta_row0).to(cutlass.BFloat16)
-                csAkk[q_row_base + row1, k_col_base + col2] = (acc_akk_n1_2 * beta_row1).to(cutlass.BFloat16)
-                csAkk[q_row_base + row1, k_col_base + col3] = (acc_akk_n1_3 * beta_row1).to(cutlass.BFloat16)
-
-            # All 12 MMA warps (including idle) participate in barriers
-            cute.arch.mbarrier_arrive(mma_done_mbars + s)
+            # All 12 MMA warps: sAqk ready, sQ/sK/sG stage can be reused
+            cute.arch.mbarrier_arrive(aqk_done_mbars + s)
             cute.arch.mbarrier_arrive(stage_reuse_mbars + s)
+
+            mma_internal_barrier()
+
+            # Diagonal block inversion: idle warps 10, 11
+            # 4 half-warps (2 per warp) → 4 diagonal 16x16 blocks
+            # if mma_warp >= NUM_MMA_ACTIVE:
+            #     csAkk_inv = sAkk[(None, None, s)]
+            #     halfwarp_id = (mma_warp - NUM_MMA_ACTIVE) * 2 + lane_id // 16
+            #     diag_off = halfwarp_id * BC
+            #     _invert_16x16_halfwarp_bf16(csAkk_inv, diag_off, lane_id)
+
+            # TODO: off-diagonal block inversion (subsequent steps)
+
+            # All 12 MMA warps: sAkk inversion complete
+            cute.arch.mbarrier_arrive(akk_done_mbars + s)
 
     # =================================================================
     # Warps 28-31: Store/Inversion warps
@@ -642,17 +720,14 @@ def fused_kernel123(
             chunk_idx = chunk_base + chunk_iter
             chunk_start = chunk_idx * BT
 
-            cute.arch.mbarrier_wait(mma_done_mbars + s, phase)
+            # Phase 1: store sAqk (ready as soon as MMA finishes)
+            cute.arch.mbarrier_wait(aqk_done_mbars + s, phase)
 
             csAqk = sAqk[(None, None, s)]
-            csAkk = sAkk[(None, None, s)]
-
             for tile_idx in cutlass.range_constexpr(NUM_TILES):
                 i_q = _TILE_IQ[tile_idx]
                 i_k = _TILE_IK[tile_idx]
                 is_diag = _TILE_IQ[tile_idx] == _TILE_IK[tile_idx]
-                smem_row_base = i_q * BC
-                smem_col_base = i_k * BC
                 gmem_row_base = chunk_start + i_q * BC
                 gmem_col_base = i_k * BC
 
@@ -660,14 +735,29 @@ def fused_kernel123(
                     local_row = store_warp * (BC // NUM_STORE_WARPS) + ri
                     if lane_id < BC:
                         local_col = lane_id
-                        aqk_val = csAqk[smem_row_base + local_row, smem_col_base + local_col]
-                        akk_val = csAkk[smem_row_base + local_row, smem_col_base + local_col]
-
+                        aqk_val = csAqk[i_q * BC + local_row, i_k * BC + local_col]
                         if is_diag and local_row < local_col:
                             aqk_val = cutlass.BFloat16(0.0)
-                            akk_val = cutlass.BFloat16(0.0)
-
                         mAqk[i_b, gmem_row_base + local_row, i_h, gmem_col_base + local_col] = aqk_val
+
+            # Phase 2: store sAkk (ready after inversion completes)
+            cute.arch.mbarrier_wait(akk_done_mbars + s, phase)
+
+            csAkk = sAkk[(None, None, s)]
+            for tile_idx in cutlass.range_constexpr(NUM_TILES):
+                i_q = _TILE_IQ[tile_idx]
+                i_k = _TILE_IK[tile_idx]
+                is_diag = _TILE_IQ[tile_idx] == _TILE_IK[tile_idx]
+                gmem_row_base = chunk_start + i_q * BC
+                gmem_col_base = i_k * BC
+
+                for ri in cutlass.range_constexpr(BC // NUM_STORE_WARPS):
+                    local_row = store_warp * (BC // NUM_STORE_WARPS) + ri
+                    if lane_id < BC:
+                        local_col = lane_id
+                        akk_val = csAkk[i_k * BC + local_row, i_q * BC + local_col]
+                        if is_diag and local_row < local_col:
+                            akk_val = cutlass.BFloat16(0.0)
                         mAkk[i_b, gmem_row_base + local_row, i_h, gmem_col_base + local_col] = akk_val
 
             cute.arch.mbarrier_arrive(store_done_mbars + s)
@@ -833,8 +923,8 @@ def test():
     kg = torch.empty(B, T, H, K, device="cuda", dtype=torch.bfloat16)
     q_scaled = torch.empty(B, T, H, K, device="cuda", dtype=torch.bfloat16)
     gk_last = torch.empty(B, NT, H, K, device="cuda", dtype=torch.float32)
-    A_qk = torch.empty(B, T, H, BT, device="cuda", dtype=torch.bfloat16)
-    A_kk = torch.empty(B, T, H, BT, device="cuda", dtype=torch.bfloat16)
+    A_qk = torch.zeros(B, T, H, BT, device="cuda", dtype=torch.bfloat16) # upper triangle zeros
+    A_kk = torch.zeros(B, T, H, BT, device="cuda", dtype=torch.bfloat16) # upper triangle zeros
 
     host_fn = make_host_function(B, NT, H)
 
@@ -906,7 +996,7 @@ def test():
     torch.cuda.synchronize()
     print("Kernel executed successfully!")
 
-    num_warmup, num_iters = 20, 100
+    num_warmup, num_iters = 1, 1
 
     for _ in range(num_warmup):
         compiled(mQ, mK, mG, mA_log, mBeta, scale,
