@@ -183,6 +183,8 @@ def fused_kernel123(
     tiled_mma_k2,
     tiled_copy_mma_A,
     tiled_copy_mma_B,
+    tiled_copy_Gcum_norm,
+    tiled_copy_Gcum_gate,
     qk_smem_layout,
     g_smem_layout,
     g_cumsum_layout,
@@ -500,6 +502,8 @@ def fused_kernel123(
         thr_mma = tiled_mma_k2.get_slice(lane_id)
         thr_copy_A = tiled_copy_mma_A.get_slice(lane_id)
         thr_copy_B = tiled_copy_mma_B.get_slice(lane_id)
+        thr_copy_Gn = tiled_copy_Gcum_norm.get_slice(tid_in_group)
+        thr_copy_Ggate = tiled_copy_Gcum_gate.get_slice(lane_id)
 
         for chunk_iter in cutlass.range_constexpr(CHUNKS_PER_BLOCK):
             s = chunk_iter % NUM_STAGES
@@ -537,14 +541,20 @@ def fused_kernel123(
                     tCrKq = tiled_mma_k2.make_fragment_A(thr_mma.partition_A(sKq_tile))
                     cute.copy(tiled_copy_mma_A, thr_copy_A.partition_S(sKq_tile), thr_copy_A.retile(tCrKq))
 
-                    g_col0 = k_block * MMA_K_TILE + tid_in_group * 2
-                    g_col1 = g_col0 + 1
-                    g_norm_0 = csGcum[q_row_base, g_col0]
-                    g_norm_1 = csGcum[q_row_base, g_col1]
-                    gate_q_0 = cute.exp2(csGcum[q_row_base + row0, g_col0] - g_norm_0, fastmath=True)
-                    gate_q_1 = cute.exp2(csGcum[q_row_base + row0, g_col1] - g_norm_1, fastmath=True)
-                    gate_q_2 = cute.exp2(csGcum[q_row_base + row1, g_col0] - g_norm_0, fastmath=True)
-                    gate_q_3 = cute.exp2(csGcum[q_row_base + row1, g_col1] - g_norm_1, fastmath=True)
+                    sGn_tile = cute.local_tile(csGcum, tiler=(1, 8), coord=(q_row_base, k_block))
+                    tCsGn = thr_copy_Gn.partition_S(sGn_tile)
+                    tCrGn = cute.make_fragment_like(tCsGn, cutlass.Float32)
+                    cute.copy(tiled_copy_Gcum_norm, tCsGn, thr_copy_Gn.retile(tCrGn))
+                    g_norm_0 = tCrGn[0]
+                    g_norm_1 = tCrGn[1]
+
+                    sGq_tile = cute.local_tile(csGcum, tiler=(16, 8), coord=(my_i_q, k_block))
+                    tCrGq = tiled_mma_k2.make_fragment_C(thr_mma.partition_C(sGq_tile))
+                    cute.copy(tiled_copy_Gcum_gate, thr_copy_Ggate.partition_S(sGq_tile), thr_copy_Ggate.retile(tCrGq))
+                    gate_q_0 = cute.exp2(tCrGq[0] - g_norm_0, fastmath=True)
+                    gate_q_1 = cute.exp2(tCrGq[1] - g_norm_1, fastmath=True)
+                    gate_q_2 = cute.exp2(tCrGq[2] - g_norm_0, fastmath=True)
+                    gate_q_3 = cute.exp2(tCrGq[3] - g_norm_1, fastmath=True)
 
                     qa0 = tCrQ[0].to(cutlass.Float32) * gate_q_0
                     qa1 = tCrQ[2].to(cutlass.Float32) * gate_q_2
@@ -563,13 +573,16 @@ def fused_kernel123(
                     tCrK_n1 = tiled_mma_k2.make_fragment_B(thr_mma.partition_B(sK_tile_n1))
                     cute.copy(tiled_copy_mma_B, thr_copy_B.partition_S(sK_tile_n1), thr_copy_B.retile(tCrK_n1))
 
-                    gk_n0_0 = cute.exp2(g_norm_0 - csGcum[k_row_base + group_id, g_col0], fastmath=True)
-                    gk_n0_1 = cute.exp2(g_norm_1 - csGcum[k_row_base + group_id, g_col1], fastmath=True)
+                    sGk_tile = cute.local_tile(csGcum, tiler=(16, 8), coord=(my_i_k, k_block))
+                    tCrGk = tiled_mma_k2.make_fragment_C(thr_mma.partition_C(sGk_tile))
+                    cute.copy(tiled_copy_Gcum_gate, thr_copy_Ggate.partition_S(sGk_tile), thr_copy_Ggate.retile(tCrGk))
+                    gk_n0_0 = cute.exp2(g_norm_0 - tCrGk[0], fastmath=True)
+                    gk_n0_1 = cute.exp2(g_norm_1 - tCrGk[1], fastmath=True)
                     k_n0_b0 = tCrK_n0[0].to(cutlass.Float32) * gk_n0_0
                     k_n0_b1 = tCrK_n0[1].to(cutlass.Float32) * gk_n0_1
 
-                    gk_n1_0 = cute.exp2(g_norm_0 - csGcum[k_row_base + group_id + 8, g_col0], fastmath=True)
-                    gk_n1_1 = cute.exp2(g_norm_1 - csGcum[k_row_base + group_id + 8, g_col1], fastmath=True)
+                    gk_n1_0 = cute.exp2(g_norm_0 - tCrGk[2], fastmath=True)
+                    gk_n1_1 = cute.exp2(g_norm_1 - tCrGk[3], fastmath=True)
                     k_n1_b0 = tCrK_n1[0].to(cutlass.Float32) * gk_n1_0
                     k_n1_b1 = tCrK_n1[1].to(cutlass.Float32) * gk_n1_1
 
@@ -731,6 +744,18 @@ def make_host_function(B, NT, H):
             cute.make_copy_atom(cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 1), cutlass.BFloat16),
             tiled_mma_k2)
 
+        copy_atom_Gcum = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            cutlass.Float32,
+            num_bits_per_copy=64
+        )
+        tiled_copy_Gcum_norm = cute.make_tiled_copy_tv(
+            copy_atom_Gcum,
+            thr_layout=cute.make_layout((1, 4)),
+            val_layout=cute.make_layout((1, 2))
+        )
+        tiled_copy_Gcum_gate = cute.make_tiled_copy_C(copy_atom_Gcum, tiled_mma_k2)
+
         smem_size = (BT * K_DIM * 2 * 2 * NUM_STAGES
                      + BT * K_DIM * 2 * NUM_STAGES
                      + BT * K_STRIDE * 4 * NUM_STAGES
@@ -746,6 +771,7 @@ def make_host_function(B, NT, H):
             mKscaled_v2, mKg_v2, mQscaled_v2, mGkLast_v2, mAqk, mAkk,
             tiled_copy_qk_k1,
             tiled_mma_k2, tiled_copy_mma_A, tiled_copy_mma_B,
+            tiled_copy_Gcum_norm, tiled_copy_Gcum_gate,
             qk_smem_3d, g_smem_3d, g_cumsum_layout, _NT,
         ).launch(
             grid=(_NT // CHUNKS_PER_BLOCK, _H, _B),

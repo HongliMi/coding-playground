@@ -23,8 +23,8 @@ Mbarriers:
   mma_done_mbars[2]:     count=384, MMA(12 warps) → Store waits for sAqk/sAkk ready
   store_done_mbars[2]:   count=128, Store(4 warps) → MMA waits for sAqk/sAkk stage free
 
-SMEM: ~160KB (q+k+g × [64,128] bf16 × 2 stages + g_cumsum [64,128] fp32 × 2 stages
-      + sAqk [16,168,2] bf16 + sAkk [16,168,2] bf16)
+SMEM: ~212KB (q+k+g × [64,128] bf16 × 2 stages + g_cumsum [64,128] fp32 × 2 stages
+      + sAqk [64,72,2] bf16 + sAkk [64,72,2] bf16 + sTemp [16,24,2] fp32)
 
 Inputs:
   g       [B,T,H,K]   bf16  raw gate
@@ -77,9 +77,13 @@ NUM_SUB_CHUNKS = BT // BC  # 4
 NUM_TILES = NUM_SUB_CHUNKS * (NUM_SUB_CHUNKS + 1) // 2  # 10 lower-tri tiles
 MMA_K_TILE = 8
 NUM_MMA_K_TILES = K_DIM // MMA_K_TILE  # 16
-AQK_TILE_COLS = NUM_TILES * BC  # 160
-AQK_TILE_PAD = 8
-AQK_TILE_STRIDE = AQK_TILE_COLS + AQK_TILE_PAD  # 168
+AQK_ROWS = BT             # 64
+AQK_COLS = BT             # 64
+AQK_PAD = 8
+AQK_STRIDE = AQK_COLS + AQK_PAD  # 72
+
+TEMP_ROWS = 16
+TEMP_COLS = 24
 
 K1_ROW_GROUPS = 8
 K1_COL_GROUPS = 2
@@ -183,6 +187,8 @@ def fused_kernel123(
     tiled_mma_k2,
     tiled_copy_mma_A,
     tiled_copy_mma_B,
+    tiled_copy_Gcum_norm,
+    tiled_copy_Gcum_gate,
     qk_smem_layout,
     g_smem_layout,
     g_cumsum_layout,
@@ -210,10 +216,15 @@ def fused_kernel123(
     sPartialLast = smem.allocate_tensor(cutlass.Float32, partial_last_layout, 128)
 
     aqk_tile_layout = cute.make_layout(
-        (BC, AQK_TILE_STRIDE, NUM_STAGES),
-        stride=(AQK_TILE_STRIDE, 1, BC * AQK_TILE_STRIDE))
+        (AQK_ROWS, AQK_STRIDE, NUM_STAGES),
+        stride=(AQK_STRIDE, 1, AQK_ROWS * AQK_STRIDE))
     sAqk = smem.allocate_tensor(cutlass.BFloat16, aqk_tile_layout, 128)
     sAkk = smem.allocate_tensor(cutlass.BFloat16, aqk_tile_layout, 128)
+
+    temp_layout = cute.make_layout(
+        (TEMP_ROWS, TEMP_COLS, NUM_STAGES),
+        stride=(TEMP_COLS, 1, TEMP_ROWS * TEMP_COLS))
+    sTemp = smem.allocate_tensor(cutlass.Float32, temp_layout, 128)
 
     # =====================================================================
     # Mbarrier allocation & init
@@ -489,7 +500,7 @@ def fused_kernel123(
 
         q_row_base = my_i_q * BC
         k_row_base = my_i_k * BC
-        tile_col_base = mma_warp * BC
+        k_col_base = my_i_k * BC
 
         group_id = lane_id // 4
         tid_in_group = lane_id % 4
@@ -500,6 +511,8 @@ def fused_kernel123(
         thr_mma = tiled_mma_k2.get_slice(lane_id)
         thr_copy_A = tiled_copy_mma_A.get_slice(lane_id)
         thr_copy_B = tiled_copy_mma_B.get_slice(lane_id)
+        thr_copy_Gn = tiled_copy_Gcum_norm.get_slice(tid_in_group)
+        thr_copy_Ggate = tiled_copy_Gcum_gate.get_slice(lane_id)
 
         for chunk_iter in cutlass.range_constexpr(CHUNKS_PER_BLOCK):
             s = chunk_iter % NUM_STAGES
@@ -537,14 +550,20 @@ def fused_kernel123(
                     tCrKq = tiled_mma_k2.make_fragment_A(thr_mma.partition_A(sKq_tile))
                     cute.copy(tiled_copy_mma_A, thr_copy_A.partition_S(sKq_tile), thr_copy_A.retile(tCrKq))
 
-                    g_col0 = k_block * MMA_K_TILE + tid_in_group * 2
-                    g_col1 = g_col0 + 1
-                    g_norm_0 = csGcum[q_row_base, g_col0]
-                    g_norm_1 = csGcum[q_row_base, g_col1]
-                    gate_q_0 = cute.exp2(csGcum[q_row_base + row0, g_col0] - g_norm_0, fastmath=True)
-                    gate_q_1 = cute.exp2(csGcum[q_row_base + row0, g_col1] - g_norm_1, fastmath=True)
-                    gate_q_2 = cute.exp2(csGcum[q_row_base + row1, g_col0] - g_norm_0, fastmath=True)
-                    gate_q_3 = cute.exp2(csGcum[q_row_base + row1, g_col1] - g_norm_1, fastmath=True)
+                    sGn_tile = cute.local_tile(csGcum, tiler=(1, 8), coord=(q_row_base, k_block))
+                    tCsGn = thr_copy_Gn.partition_S(sGn_tile)
+                    tCrGn = cute.make_fragment_like(tCsGn, cutlass.Float32)
+                    cute.copy(tiled_copy_Gcum_norm, tCsGn, thr_copy_Gn.retile(tCrGn))
+                    g_norm_0 = tCrGn[0]
+                    g_norm_1 = tCrGn[1]
+
+                    sGq_tile = cute.local_tile(csGcum, tiler=(16, 8), coord=(my_i_q, k_block))
+                    tCrGq = tiled_mma_k2.make_fragment_C(thr_mma.partition_C(sGq_tile))
+                    cute.copy(tiled_copy_Gcum_gate, thr_copy_Ggate.partition_S(sGq_tile), thr_copy_Ggate.retile(tCrGq))
+                    gate_q_0 = cute.exp2(tCrGq[0] - g_norm_0, fastmath=True)
+                    gate_q_1 = cute.exp2(tCrGq[1] - g_norm_1, fastmath=True)
+                    gate_q_2 = cute.exp2(tCrGq[2] - g_norm_0, fastmath=True)
+                    gate_q_3 = cute.exp2(tCrGq[3] - g_norm_1, fastmath=True)
 
                     qa0 = tCrQ[0].to(cutlass.Float32) * gate_q_0
                     qa1 = tCrQ[2].to(cutlass.Float32) * gate_q_2
@@ -563,13 +582,16 @@ def fused_kernel123(
                     tCrK_n1 = tiled_mma_k2.make_fragment_B(thr_mma.partition_B(sK_tile_n1))
                     cute.copy(tiled_copy_mma_B, thr_copy_B.partition_S(sK_tile_n1), thr_copy_B.retile(tCrK_n1))
 
-                    gk_n0_0 = cute.exp2(g_norm_0 - csGcum[k_row_base + group_id, g_col0], fastmath=True)
-                    gk_n0_1 = cute.exp2(g_norm_1 - csGcum[k_row_base + group_id, g_col1], fastmath=True)
+                    sGk_tile = cute.local_tile(csGcum, tiler=(16, 8), coord=(my_i_k, k_block))
+                    tCrGk = tiled_mma_k2.make_fragment_C(thr_mma.partition_C(sGk_tile))
+                    cute.copy(tiled_copy_Gcum_gate, thr_copy_Ggate.partition_S(sGk_tile), thr_copy_Ggate.retile(tCrGk))
+                    gk_n0_0 = cute.exp2(g_norm_0 - tCrGk[0], fastmath=True)
+                    gk_n0_1 = cute.exp2(g_norm_1 - tCrGk[1], fastmath=True)
                     k_n0_b0 = tCrK_n0[0].to(cutlass.Float32) * gk_n0_0
                     k_n0_b1 = tCrK_n0[1].to(cutlass.Float32) * gk_n0_1
 
-                    gk_n1_0 = cute.exp2(g_norm_0 - csGcum[k_row_base + group_id + 8, g_col0], fastmath=True)
-                    gk_n1_1 = cute.exp2(g_norm_1 - csGcum[k_row_base + group_id + 8, g_col1], fastmath=True)
+                    gk_n1_0 = cute.exp2(g_norm_0 - tCrGk[2], fastmath=True)
+                    gk_n1_1 = cute.exp2(g_norm_1 - tCrGk[3], fastmath=True)
                     k_n1_b0 = tCrK_n1[0].to(cutlass.Float32) * gk_n1_0
                     k_n1_b1 = tCrK_n1[1].to(cutlass.Float32) * gk_n1_1
 
@@ -586,23 +608,23 @@ def fused_kernel123(
                         ka0, ka1, ka2, ka3, k_n1_b0, k_n1_b1,
                         acc_akk_n1_0, acc_akk_n1_1, acc_akk_n1_2, acc_akk_n1_3)
 
-                csAqk[row0, tile_col_base + col0] = (acc_aqk_n0_0 * scale).to(cutlass.BFloat16)
-                csAqk[row0, tile_col_base + col1] = (acc_aqk_n0_1 * scale).to(cutlass.BFloat16)
-                csAqk[row1, tile_col_base + col0] = (acc_aqk_n0_2 * scale).to(cutlass.BFloat16)
-                csAqk[row1, tile_col_base + col1] = (acc_aqk_n0_3 * scale).to(cutlass.BFloat16)
-                csAqk[row0, tile_col_base + col2] = (acc_aqk_n1_0 * scale).to(cutlass.BFloat16)
-                csAqk[row0, tile_col_base + col3] = (acc_aqk_n1_1 * scale).to(cutlass.BFloat16)
-                csAqk[row1, tile_col_base + col2] = (acc_aqk_n1_2 * scale).to(cutlass.BFloat16)
-                csAqk[row1, tile_col_base + col3] = (acc_aqk_n1_3 * scale).to(cutlass.BFloat16)
+                csAqk[q_row_base + row0, k_col_base + col0] = (acc_aqk_n0_0 * scale).to(cutlass.BFloat16)
+                csAqk[q_row_base + row0, k_col_base + col1] = (acc_aqk_n0_1 * scale).to(cutlass.BFloat16)
+                csAqk[q_row_base + row1, k_col_base + col0] = (acc_aqk_n0_2 * scale).to(cutlass.BFloat16)
+                csAqk[q_row_base + row1, k_col_base + col1] = (acc_aqk_n0_3 * scale).to(cutlass.BFloat16)
+                csAqk[q_row_base + row0, k_col_base + col2] = (acc_aqk_n1_0 * scale).to(cutlass.BFloat16)
+                csAqk[q_row_base + row0, k_col_base + col3] = (acc_aqk_n1_1 * scale).to(cutlass.BFloat16)
+                csAqk[q_row_base + row1, k_col_base + col2] = (acc_aqk_n1_2 * scale).to(cutlass.BFloat16)
+                csAqk[q_row_base + row1, k_col_base + col3] = (acc_aqk_n1_3 * scale).to(cutlass.BFloat16)
 
-                csAkk[row0, tile_col_base + col0] = (acc_akk_n0_0 * beta_row0).to(cutlass.BFloat16)
-                csAkk[row0, tile_col_base + col1] = (acc_akk_n0_1 * beta_row0).to(cutlass.BFloat16)
-                csAkk[row1, tile_col_base + col0] = (acc_akk_n0_2 * beta_row1).to(cutlass.BFloat16)
-                csAkk[row1, tile_col_base + col1] = (acc_akk_n0_3 * beta_row1).to(cutlass.BFloat16)
-                csAkk[row0, tile_col_base + col2] = (acc_akk_n1_0 * beta_row0).to(cutlass.BFloat16)
-                csAkk[row0, tile_col_base + col3] = (acc_akk_n1_1 * beta_row0).to(cutlass.BFloat16)
-                csAkk[row1, tile_col_base + col2] = (acc_akk_n1_2 * beta_row1).to(cutlass.BFloat16)
-                csAkk[row1, tile_col_base + col3] = (acc_akk_n1_3 * beta_row1).to(cutlass.BFloat16)
+                csAkk[q_row_base + row0, k_col_base + col0] = (acc_akk_n0_0 * beta_row0).to(cutlass.BFloat16)
+                csAkk[q_row_base + row0, k_col_base + col1] = (acc_akk_n0_1 * beta_row0).to(cutlass.BFloat16)
+                csAkk[q_row_base + row1, k_col_base + col0] = (acc_akk_n0_2 * beta_row1).to(cutlass.BFloat16)
+                csAkk[q_row_base + row1, k_col_base + col1] = (acc_akk_n0_3 * beta_row1).to(cutlass.BFloat16)
+                csAkk[q_row_base + row0, k_col_base + col2] = (acc_akk_n1_0 * beta_row0).to(cutlass.BFloat16)
+                csAkk[q_row_base + row0, k_col_base + col3] = (acc_akk_n1_1 * beta_row0).to(cutlass.BFloat16)
+                csAkk[q_row_base + row1, k_col_base + col2] = (acc_akk_n1_2 * beta_row1).to(cutlass.BFloat16)
+                csAkk[q_row_base + row1, k_col_base + col3] = (acc_akk_n1_3 * beta_row1).to(cutlass.BFloat16)
 
             # All 12 MMA warps (including idle) participate in barriers
             cute.arch.mbarrier_arrive(mma_done_mbars + s)
@@ -629,7 +651,8 @@ def fused_kernel123(
                 i_q = _TILE_IQ[tile_idx]
                 i_k = _TILE_IK[tile_idx]
                 is_diag = _TILE_IQ[tile_idx] == _TILE_IK[tile_idx]
-                tile_col_base = tile_idx * BC
+                smem_row_base = i_q * BC
+                smem_col_base = i_k * BC
                 gmem_row_base = chunk_start + i_q * BC
                 gmem_col_base = i_k * BC
 
@@ -637,8 +660,8 @@ def fused_kernel123(
                     local_row = store_warp * (BC // NUM_STORE_WARPS) + ri
                     if lane_id < BC:
                         local_col = lane_id
-                        aqk_val = csAqk[local_row, tile_col_base + local_col]
-                        akk_val = csAkk[local_row, tile_col_base + local_col]
+                        aqk_val = csAqk[smem_row_base + local_row, smem_col_base + local_col]
+                        akk_val = csAkk[smem_row_base + local_row, smem_col_base + local_col]
 
                         if is_diag and local_row < local_col:
                             aqk_val = cutlass.BFloat16(0.0)
@@ -731,11 +754,24 @@ def make_host_function(B, NT, H):
             cute.make_copy_atom(cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 1), cutlass.BFloat16),
             tiled_mma_k2)
 
+        copy_atom_Gcum = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            cutlass.Float32,
+            num_bits_per_copy=64
+        )
+        tiled_copy_Gcum_norm = cute.make_tiled_copy_tv(
+            copy_atom_Gcum,
+            thr_layout=cute.make_layout((1, 4)),
+            val_layout=cute.make_layout((1, 2))
+        )
+        tiled_copy_Gcum_gate = cute.make_tiled_copy_C(copy_atom_Gcum, tiled_mma_k2)
+
         smem_size = (BT * K_DIM * 2 * 2 * NUM_STAGES
                      + BT * K_DIM * 2 * NUM_STAGES
                      + BT * K_STRIDE * 4 * NUM_STAGES
                      + K1_ROW_GROUPS * PARTIAL_COLS * 4
-                     + BC * AQK_TILE_STRIDE * 2 * NUM_STAGES * 2
+                     + AQK_ROWS * AQK_STRIDE * 2 * NUM_STAGES * 2
+                     + TEMP_ROWS * TEMP_COLS * 4 * NUM_STAGES
                      + 512)
 
         fused_kernel123(
@@ -746,6 +782,7 @@ def make_host_function(B, NT, H):
             mKscaled_v2, mKg_v2, mQscaled_v2, mGkLast_v2, mAqk, mAkk,
             tiled_copy_qk_k1,
             tiled_mma_k2, tiled_copy_mma_A, tiled_copy_mma_B,
+            tiled_copy_Gcum_norm, tiled_copy_Gcum_gate,
             qk_smem_3d, g_smem_3d, g_cumsum_layout, _NT,
         ).launch(
             grid=(_NT // CHUNKS_PER_BLOCK, _H, _B),
@@ -774,7 +811,8 @@ def test():
                 + BT * K_DIM * 2 * NUM_STAGES
                 + BT * K_STRIDE * 4 * NUM_STAGES
                 + K1_ROW_GROUPS * PARTIAL_COLS * 4
-                + BC * AQK_TILE_STRIDE * 2 * NUM_STAGES * 2
+                + AQK_ROWS * AQK_STRIDE * 2 * NUM_STAGES * 2
+                + TEMP_ROWS * TEMP_COLS * 4 * NUM_STAGES
                 + 512)
     print(f"Grid: ({NT // CHUNKS_PER_BLOCK}, {H}, {B}), Block: {THREADS} ({NUM_WARPS} warps)")
     print(f"Warp layout: K1+TMA={NUM_K1_TMA_WARPS} | MMA={NUM_MMA_WARPS} ({NUM_MMA_ACTIVE} active) | Store={NUM_STORE_WARPS}")
@@ -839,7 +877,7 @@ def test():
                 ["cuobjdump", "-sass", cubin_file],
                 capture_output=True, text=True)
             if result.returncode == 0:
-                sass_file = os.path.join(script_dir, "fuse_kernel123_16x1_ws.sass")
+                sass_file = os.path.join(script_dir, "fuse_kernel123_all.sass")
                 with open(sass_file, 'w') as f:
                     f.write(result.stdout)
                 print(f"SASS saved to: {sass_file}")
