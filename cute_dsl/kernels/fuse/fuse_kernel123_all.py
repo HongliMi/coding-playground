@@ -13,20 +13,18 @@ Block: 1024 threads (32 warps), warp-specialized with setmaxnreg (all groups 4-a
 Pipeline (prefetch overlap):
   Warps 0-15:  prefetch chunk 0→stage 0 (warp 0), then loop:
                   TMA next chunk (warp 0), wait cur chunk, K1 compute, arrive(k1_done)
-  Warps 16-27: wait(k1_done) + wait(store_done), MMA, arrive(aqk_done + stage_reuse),
-                  Akk inversion, arrive(akk_done)
-  Warps 28-31: wait(aqk_done) → store sAqk→GMEM, wait(akk_done) → store sAkk→GMEM, arrive(store_done)
+  Warps 16-27: wait(k1_done) + wait(store_done) + wait(tma), MMA, arrive(mma_done + stage_reuse)
+  Warps 28-31: wait(mma_done), store sAqk/sAkk→GMEM, arrive(store_done)
 
 Mbarriers:
   tma_mbars[2]:          count=1, warp 0 lane 0 → K1+MMA wait for TMA data
   stage_reuse_mbars[2]:  count=384, MMA(12 warps) → warp 0 waits before TMA reuse
   k1_done_mbars[2]:      count=512, K1(16 warps) → MMA waits for g_cumsum ready
-  aqk_done_mbars[2]:     count=384, MMA(12 warps) → Store waits for sAqk ready
-  akk_done_mbars[2]:     count=384, MMA(12 warps) → Store waits for sAkk ready (after inversion)
+  mma_done_mbars[2]:     count=384, MMA(12 warps) → Store waits for sAqk/sAkk ready
   store_done_mbars[2]:   count=128, Store(4 warps) → MMA waits for sAqk/sAkk stage free
 
-SMEM: ~212KB (q+k+g × [64,128] bf16 × 2 stages + g_cumsum [64,128] fp32 × 2 stages
-      + sAqk [64,72,2] bf16 + sAkk [64,72,2] bf16 + sTemp [16,24,2] fp32)
+SMEM: ~160KB (q+k+g × [64,128] bf16 × 2 stages + g_cumsum [64,128] fp32 × 2 stages
+      + sAqk [16,168,2] bf16 + sAkk [16,168,2] bf16)
 
 Inputs:
   g       [B,T,H,K]   bf16  raw gate
@@ -45,6 +43,10 @@ Outputs (g_cumsum stays in SMEM, not written to GMEM):
   A_kk       [B,T,H,BT]  bf16  full inverted lower triangular
 """
 
+import sys
+sys.path.insert(0, '/home/scratch.peiyuanz_gpu/mhl/Personal_workspace/scripts/kda_optimized')
+sys.path.insert(0, '/home/scratch.peiyuanz_gpu/mhl/Personal_workspace/flash-linear-attention')
+
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute import KeepPTX, KeepCUBIN
@@ -58,6 +60,11 @@ import time
 import subprocess
 import os
 import glob
+import cuda.bindings.driver as cuda_drv
+
+from act_cumsum_scale_fused_cute import act_cumsum_scale_fused_v2_vec as ref_k1
+from intra_parellel_cute import run_kda_Akk as ref_k2
+from fla.ops.kda.chunk_intra import chunk_kda_fwd_kernel_inter_solve_fused as ref_k3
 
 B200_PEAK_BW_GBS = 7672  # GB/s
 
@@ -79,13 +86,9 @@ NUM_SUB_CHUNKS = BT // BC  # 4
 NUM_TILES = NUM_SUB_CHUNKS * (NUM_SUB_CHUNKS + 1) // 2  # 10 lower-tri tiles
 MMA_K_TILE = 8
 NUM_MMA_K_TILES = K_DIM // MMA_K_TILE  # 16
-AQK_ROWS = BT             # 64
-AQK_COLS = BT             # 64
-AQK_PAD = 8
-AQK_STRIDE = AQK_COLS + AQK_PAD  # 72
-
-TEMP_ROWS = 16
-TEMP_COLS = 24
+AQK_TILE_COLS = NUM_TILES * BC  # 160
+AQK_TILE_PAD = 8
+AQK_TILE_STRIDE = AQK_TILE_COLS + AQK_TILE_PAD  # 168
 
 K1_ROW_GROUPS = 8
 K1_COL_GROUPS = 2
@@ -127,65 +130,6 @@ def k1_internal_barrier(*, loc=None, ip=None):
         has_side_effects=True, is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
     )
-
-
-@dsl_user_op
-def mma_internal_barrier(*, loc=None, ip=None):
-    """Named barrier for MMA warps (16-27, 384 threads). barrier_id=3."""
-    llvm.inline_asm(
-        T.i32(), [],
-        "membar.cta; bar.sync 3, 384; mov.u32 $0, 0;",
-        "=r",
-        has_side_effects=True, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
-    )
-
-
-@dsl_user_op
-def _invert_16x16_halfwarp_bf16(
-    sA: cute.Tensor,
-    diag_offset,
-    lane_id,
-    *,
-    loc=None,
-    ip=None,
-):
-    """Invert a 16x16 unit lower triangular block in-place (bf16 smem).
-
-    Uses half-warp (16 threads). Anti-diagonal sweep with warp shuffle.
-    Computation in fp32, I/O in bf16. Register-optimized: rA eliminated
-    by re-reading from SMEM; incremental accumulation minimizes live regs.
-    """
-    my_row = lane_id % 16
-    halfwarp_base = (lane_id // 16) * 16
-
-    row_off = diag_offset
-    col_off = diag_offset
-
-    rInv = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), cutlass.Float32)
-
-    rInv[0] = cutlass.Float32(1.0)
-    for x in range(1, 16):
-        rInv[x] = cutlass.Float32(0.0)
-
-    for d in range(1, 16):
-        col_d = my_row - d
-        valid = cutlass.Float32(col_d >= 0)
-        a_val = sA[row_off + my_row, col_off + col_d].to(cutlass.Float32) * valid
-
-        acc = cutlass.Float32(0.0)
-        for j in range(1, d):
-            a_re = sA[row_off + my_row, col_off + my_row - (d - j)].to(cutlass.Float32)
-            inv_shfl = cute.arch.shuffle_sync(rInv[j], halfwarp_base + my_row - d + j)
-            acc = acc + a_re * inv_shfl
-
-        rInv[d] = (-a_val - acc) * valid
-
-    rInv[0] = cutlass.Float32(1.0)
-
-    sA[row_off + my_row, col_off + my_row] = rInv[0].to(cutlass.BFloat16)
-    for d in range(1, 16):
-        sA[row_off + my_row, col_off + (my_row + 16 - d) % 16] = (rInv[d] * cutlass.Float32(my_row >= d)).to(cutlass.BFloat16)
 
 
 @dsl_user_op
@@ -277,15 +221,10 @@ def fused_kernel123(
     sPartialLast = smem.allocate_tensor(cutlass.Float32, partial_last_layout, 128)
 
     aqk_tile_layout = cute.make_layout(
-        (AQK_ROWS, AQK_STRIDE, NUM_STAGES),
-        stride=(AQK_STRIDE, 1, AQK_ROWS * AQK_STRIDE))
+        (BC, AQK_TILE_STRIDE, NUM_STAGES),
+        stride=(AQK_TILE_STRIDE, 1, BC * AQK_TILE_STRIDE))
     sAqk = smem.allocate_tensor(cutlass.BFloat16, aqk_tile_layout, 128)
     sAkk = smem.allocate_tensor(cutlass.BFloat16, aqk_tile_layout, 128)
-
-    temp_layout = cute.make_layout(
-        (TEMP_ROWS, TEMP_COLS, NUM_STAGES),
-        stride=(TEMP_COLS, 1, TEMP_ROWS * TEMP_COLS))
-    sTemp = smem.allocate_tensor(cutlass.Float32, temp_layout, 128)
 
     # =====================================================================
     # Mbarrier allocation & init
@@ -293,8 +232,7 @@ def fused_kernel123(
     tma_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
     stage_reuse_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
     k1_done_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
-    aqk_done_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
-    akk_done_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
+    mma_done_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
     store_done_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
 
     bytes_per_stage = BT * K_DIM * 2 * 3
@@ -304,8 +242,7 @@ def fused_kernel123(
             cute.arch.mbarrier_init(tma_mbars + s, 1)
             cute.arch.mbarrier_init(stage_reuse_mbars + s, NUM_MMA_WARPS * 32)
             cute.arch.mbarrier_init(k1_done_mbars + s, NUM_K1_TMA_WARPS * 32)
-            cute.arch.mbarrier_init(aqk_done_mbars + s, NUM_MMA_WARPS * 32)
-            cute.arch.mbarrier_init(akk_done_mbars + s, NUM_MMA_WARPS * 32)
+            cute.arch.mbarrier_init(mma_done_mbars + s, NUM_MMA_WARPS * 32)
             cute.arch.mbarrier_init(store_done_mbars + s, NUM_STORE_WARPS * 32)
     cute.arch.mbarrier_init_fence()
     cute.arch.barrier()
@@ -563,7 +500,11 @@ def fused_kernel123(
 
         q_row_base = my_i_q * BC
         k_row_base = my_i_k * BC
-        k_col_base = my_i_k * BC
+        tile_col_base = mma_warp * BC
+
+        norm_row = q_row_base
+        if my_i_q == my_i_k:
+            norm_row = q_row_base + cutlass.Int32(BC // 2)
 
         group_id = lane_id // 4
         tid_in_group = lane_id % 4
@@ -613,7 +554,7 @@ def fused_kernel123(
                     tCrKq = tiled_mma_k2.make_fragment_A(thr_mma.partition_A(sKq_tile))
                     cute.copy(tiled_copy_mma_A, thr_copy_A.partition_S(sKq_tile), thr_copy_A.retile(tCrKq))
 
-                    sGn_tile = cute.local_tile(csGcum, tiler=(1, 8), coord=(q_row_base, k_block))
+                    sGn_tile = cute.local_tile(csGcum, tiler=(1, 8), coord=(norm_row, k_block))
                     tCsGn = thr_copy_Gn.partition_S(sGn_tile)
                     tCrGn = cute.make_fragment_like(tCsGn, cutlass.Float32)
                     cute.copy(tiled_copy_Gcum_norm, tCsGn, thr_copy_Gn.retile(tCrGn))
@@ -670,43 +611,28 @@ def fused_kernel123(
                     acc_akk_n1_0, acc_akk_n1_1, acc_akk_n1_2, acc_akk_n1_3 = mma_tf32_m16n8k8(
                         ka0, ka1, ka2, ka3, k_n1_b0, k_n1_b1,
                         acc_akk_n1_0, acc_akk_n1_1, acc_akk_n1_2, acc_akk_n1_3)
-                # compiler auto vectorize
-                csAqk[q_row_base + row0, k_col_base + col0] = (acc_aqk_n0_0 * scale).to(cutlass.BFloat16)
-                csAqk[q_row_base + row0, k_col_base + col1] = (acc_aqk_n0_1 * scale).to(cutlass.BFloat16)
-                csAqk[q_row_base + row1, k_col_base + col0] = (acc_aqk_n0_2 * scale).to(cutlass.BFloat16)
-                csAqk[q_row_base + row1, k_col_base + col1] = (acc_aqk_n0_3 * scale).to(cutlass.BFloat16)
-                csAqk[q_row_base + row0, k_col_base + col2] = (acc_aqk_n1_0 * scale).to(cutlass.BFloat16)
-                csAqk[q_row_base + row0, k_col_base + col3] = (acc_aqk_n1_1 * scale).to(cutlass.BFloat16)
-                csAqk[q_row_base + row1, k_col_base + col2] = (acc_aqk_n1_2 * scale).to(cutlass.BFloat16)
-                csAqk[q_row_base + row1, k_col_base + col3] = (acc_aqk_n1_3 * scale).to(cutlass.BFloat16)
-                #store to upper triangle
-                csAkk[k_col_base + row0, q_row_base + col0] = (acc_akk_n0_0 * beta_row0).to(cutlass.BFloat16)
-                csAkk[k_col_base + row0, q_row_base + col1] = (acc_akk_n0_1 * beta_row0).to(cutlass.BFloat16)
-                csAkk[k_col_base + row1, q_row_base + col0] = (acc_akk_n0_2 * beta_row1).to(cutlass.BFloat16)
-                csAkk[k_col_base + row1, q_row_base + col1] = (acc_akk_n0_3 * beta_row1).to(cutlass.BFloat16)
-                csAkk[k_col_base + row0, q_row_base + col2] = (acc_akk_n1_0 * beta_row0).to(cutlass.BFloat16)
-                csAkk[k_col_base + row0, q_row_base + col3] = (acc_akk_n1_1 * beta_row0).to(cutlass.BFloat16)
-                csAkk[k_col_base + row1, q_row_base + col2] = (acc_akk_n1_2 * beta_row1).to(cutlass.BFloat16)
-                csAkk[k_col_base + row1, q_row_base + col3] = (acc_akk_n1_3 * beta_row1).to(cutlass.BFloat16)
 
-            # All 12 MMA warps: sAqk ready, sQ/sK/sG stage can be reused
-            cute.arch.mbarrier_arrive(aqk_done_mbars + s)
+                csAqk[row0, tile_col_base + col0] = (acc_aqk_n0_0 * scale).to(cutlass.BFloat16)
+                csAqk[row0, tile_col_base + col1] = (acc_aqk_n0_1 * scale).to(cutlass.BFloat16)
+                csAqk[row1, tile_col_base + col0] = (acc_aqk_n0_2 * scale).to(cutlass.BFloat16)
+                csAqk[row1, tile_col_base + col1] = (acc_aqk_n0_3 * scale).to(cutlass.BFloat16)
+                csAqk[row0, tile_col_base + col2] = (acc_aqk_n1_0 * scale).to(cutlass.BFloat16)
+                csAqk[row0, tile_col_base + col3] = (acc_aqk_n1_1 * scale).to(cutlass.BFloat16)
+                csAqk[row1, tile_col_base + col2] = (acc_aqk_n1_2 * scale).to(cutlass.BFloat16)
+                csAqk[row1, tile_col_base + col3] = (acc_aqk_n1_3 * scale).to(cutlass.BFloat16)
+
+                csAkk[row0, tile_col_base + col0] = (acc_akk_n0_0 * beta_row0).to(cutlass.BFloat16)
+                csAkk[row0, tile_col_base + col1] = (acc_akk_n0_1 * beta_row0).to(cutlass.BFloat16)
+                csAkk[row1, tile_col_base + col0] = (acc_akk_n0_2 * beta_row1).to(cutlass.BFloat16)
+                csAkk[row1, tile_col_base + col1] = (acc_akk_n0_3 * beta_row1).to(cutlass.BFloat16)
+                csAkk[row0, tile_col_base + col2] = (acc_akk_n1_0 * beta_row0).to(cutlass.BFloat16)
+                csAkk[row0, tile_col_base + col3] = (acc_akk_n1_1 * beta_row0).to(cutlass.BFloat16)
+                csAkk[row1, tile_col_base + col2] = (acc_akk_n1_2 * beta_row1).to(cutlass.BFloat16)
+                csAkk[row1, tile_col_base + col3] = (acc_akk_n1_3 * beta_row1).to(cutlass.BFloat16)
+
+            # All 12 MMA warps (including idle) participate in barriers
+            cute.arch.mbarrier_arrive(mma_done_mbars + s)
             cute.arch.mbarrier_arrive(stage_reuse_mbars + s)
-
-            mma_internal_barrier()
-
-            # Diagonal block inversion: idle warps 10, 11
-            # 4 half-warps (2 per warp) → 4 diagonal 16x16 blocks
-            # if mma_warp >= NUM_MMA_ACTIVE:
-            #     csAkk_inv = sAkk[(None, None, s)]
-            #     halfwarp_id = (mma_warp - NUM_MMA_ACTIVE) * 2 + lane_id // 16
-            #     diag_off = halfwarp_id * BC
-            #     _invert_16x16_halfwarp_bf16(csAkk_inv, diag_off, lane_id)
-
-            # TODO: off-diagonal block inversion (subsequent steps)
-
-            # All 12 MMA warps: sAkk inversion complete
-            cute.arch.mbarrier_arrive(akk_done_mbars + s)
 
     # =================================================================
     # Warps 28-31: Store/Inversion warps
@@ -720,14 +646,16 @@ def fused_kernel123(
             chunk_idx = chunk_base + chunk_iter
             chunk_start = chunk_idx * BT
 
-            # Phase 1: store sAqk (ready as soon as MMA finishes)
-            cute.arch.mbarrier_wait(aqk_done_mbars + s, phase)
+            cute.arch.mbarrier_wait(mma_done_mbars + s, phase)
 
             csAqk = sAqk[(None, None, s)]
+            csAkk = sAkk[(None, None, s)]
+
             for tile_idx in cutlass.range_constexpr(NUM_TILES):
                 i_q = _TILE_IQ[tile_idx]
                 i_k = _TILE_IK[tile_idx]
                 is_diag = _TILE_IQ[tile_idx] == _TILE_IK[tile_idx]
+                tile_col_base = tile_idx * BC
                 gmem_row_base = chunk_start + i_q * BC
                 gmem_col_base = i_k * BC
 
@@ -735,29 +663,14 @@ def fused_kernel123(
                     local_row = store_warp * (BC // NUM_STORE_WARPS) + ri
                     if lane_id < BC:
                         local_col = lane_id
-                        aqk_val = csAqk[i_q * BC + local_row, i_k * BC + local_col]
+                        aqk_val = csAqk[local_row, tile_col_base + local_col]
+                        akk_val = csAkk[local_row, tile_col_base + local_col]
+
                         if is_diag and local_row < local_col:
                             aqk_val = cutlass.BFloat16(0.0)
-                        mAqk[i_b, gmem_row_base + local_row, i_h, gmem_col_base + local_col] = aqk_val
-
-            # Phase 2: store sAkk (ready after inversion completes)
-            cute.arch.mbarrier_wait(akk_done_mbars + s, phase)
-
-            csAkk = sAkk[(None, None, s)]
-            for tile_idx in cutlass.range_constexpr(NUM_TILES):
-                i_q = _TILE_IQ[tile_idx]
-                i_k = _TILE_IK[tile_idx]
-                is_diag = _TILE_IQ[tile_idx] == _TILE_IK[tile_idx]
-                gmem_row_base = chunk_start + i_q * BC
-                gmem_col_base = i_k * BC
-
-                for ri in cutlass.range_constexpr(BC // NUM_STORE_WARPS):
-                    local_row = store_warp * (BC // NUM_STORE_WARPS) + ri
-                    if lane_id < BC:
-                        local_col = lane_id
-                        akk_val = csAkk[i_k * BC + local_row, i_q * BC + local_col]
-                        if is_diag and local_row < local_col:
                             akk_val = cutlass.BFloat16(0.0)
+
+                        mAqk[i_b, gmem_row_base + local_row, i_h, gmem_col_base + local_col] = aqk_val
                         mAkk[i_b, gmem_row_base + local_row, i_h, gmem_col_base + local_col] = akk_val
 
             cute.arch.mbarrier_arrive(store_done_mbars + s)
@@ -860,8 +773,7 @@ def make_host_function(B, NT, H):
                      + BT * K_DIM * 2 * NUM_STAGES
                      + BT * K_STRIDE * 4 * NUM_STAGES
                      + K1_ROW_GROUPS * PARTIAL_COLS * 4
-                     + AQK_ROWS * AQK_STRIDE * 2 * NUM_STAGES * 2
-                     + TEMP_ROWS * TEMP_COLS * 4 * NUM_STAGES
+                     + BC * AQK_TILE_STRIDE * 2 * NUM_STAGES * 2
                      + 512)
 
         fused_kernel123(
@@ -884,50 +796,64 @@ def make_host_function(B, NT, H):
 
 
 # =========================================================================
-# Test
+# Test Helpers
 # =========================================================================
-def test():
-    cutlass.cuda.initialize_cuda_context()
+_k2_ref_cache = {}
+_k2_ref_dummy = {}
 
-    B, H, K = 1, 96, 128
-    NT = 128
-    T = NT * BT
 
-    print("=" * 60)
-    print("Fused K1+K2+K3 Kernel (warp-specialized + setmaxnreg)")
-    print("=" * 60)
-    print(f"B={B}, T={T}, H={H}, K={K}, NT={NT}, BT={BT}, BC={BC}")
-    smem_est = (BT * K_DIM * 2 * 2 * NUM_STAGES
-                + BT * K_DIM * 2 * NUM_STAGES
-                + BT * K_STRIDE * 4 * NUM_STAGES
-                + K1_ROW_GROUPS * PARTIAL_COLS * 4
-                + AQK_ROWS * AQK_STRIDE * 2 * NUM_STAGES * 2
-                + TEMP_ROWS * TEMP_COLS * 4 * NUM_STAGES
-                + 512)
-    print(f"Grid: ({NT // CHUNKS_PER_BLOCK}, {H}, {B}), Block: {THREADS} ({NUM_WARPS} warps)")
-    print(f"Warp layout: K1+TMA={NUM_K1_TMA_WARPS} | MMA={NUM_MMA_WARPS} ({NUM_MMA_ACTIVE} active) | Store={NUM_STORE_WARPS}")
-    print(f"Registers:   K1+TMA={NUM_REGS_K1} | MMA={NUM_REGS_MMA} | Store={NUM_REGS_STORE}")
-    print(f"SMEM: {smem_est} bytes ({smem_est / 1024:.1f} KB)")
-    print()
+def _ct_ref(t, etype):
+    r = from_dlpack(t, assumed_align=16)
+    r.element_type = etype
+    return r
 
-    torch.manual_seed(42)
-    scale = 1.0 / (K ** 0.5)
 
-    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
-    g = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
-    A_log = torch.randn(H, device="cuda", dtype=torch.float32)
-    beta = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16)
+def _get_k2_ref_dummy(device):
+    dev_idx = device.index if device.index is not None else 0
+    if dev_idx not in _k2_ref_dummy:
+        _k2_ref_dummy[dev_idx] = (
+            _ct_ref(torch.empty(2, dtype=torch.int64, device=device), cutlass.Int64),
+            _ct_ref(torch.empty(1, 2, dtype=torch.int64, device=device), cutlass.Int64),
+        )
+    return _k2_ref_dummy[dev_idx]
 
-    k_scaled = torch.empty(B, T, H, K, device="cuda", dtype=torch.bfloat16)
-    kg = torch.empty(B, T, H, K, device="cuda", dtype=torch.bfloat16)
-    q_scaled = torch.empty(B, T, H, K, device="cuda", dtype=torch.bfloat16)
-    gk_last = torch.empty(B, NT, H, K, device="cuda", dtype=torch.float32)
-    A_qk = torch.zeros(B, T, H, BT, device="cuda", dtype=torch.bfloat16) # upper triangle zeros
-    A_kk = torch.zeros(B, T, H, BT, device="cuda", dtype=torch.bfloat16) # upper triangle zeros
 
+def _compare(name, ref, fused):
+    """Compare two tensors, masking out NaN/inf from both sides."""
+    r, f = ref.float(), fused.float()
+    valid = torch.isfinite(r) & torch.isfinite(f)
+    n_valid = valid.sum().item()
+    r_nan = r.isnan().sum().item()
+    f_nan = f.isnan().sum().item()
+
+    if n_valid == 0:
+        print(f"  {name:<15s}  no valid elements  nan: ref={r_nan} fused={f_nan}")
+        return
+
+    rv, fv = r[valid], f[valid]
+    diff = (rv - fv).abs()
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+
+    n = diff.numel()
+    n_ge_1e2 = (diff >= 1e-2).sum().item()
+    n_ge_1e3 = (diff >= 1e-3).sum().item()
+    pct_1e2 = (n - n_ge_1e2) / n * 100
+    pct_1e3 = (n - n_ge_1e3) / n * 100
+
+    nan_info = ""
+    if r_nan > 0 or f_nan > 0:
+        nan_info = f"  nan: ref={r_nan} fused={f_nan}"
+    print(f"  {name:<15s}  max={max_diff:.6f}  mean={mean_diff:.6f}")
+    print(f"         |diff|<1e-2: {pct_1e2:.3f}% ({n_ge_1e2} outliers),  "
+          f"|diff|<1e-3: {pct_1e3:.3f}% ({n_ge_1e3} outliers){nan_info}")
+
+
+def _compile_fused(B, NT, H, q, k, g, A_log, beta, scale,
+                   k_scaled, kg, q_scaled, gk_last, A_qk, A_kk,
+                   keep_artifacts=False):
+    """Compile fused K1+K2 kernel, return (compiled_fn, cute_args)."""
     host_fn = make_host_function(B, NT, H)
-
     dl = from_dlpack
 
     def _ct(t, etype):
@@ -935,98 +861,300 @@ def test():
         r.element_type = etype
         return r
 
-    mQ = _ct(q, cutlass.BFloat16)
-    mK = _ct(k, cutlass.BFloat16)
-    mG = _ct(g, cutlass.BFloat16)
-    mA_log = _ct(A_log, cutlass.Float32)
-    mBeta = _ct(beta, cutlass.BFloat16)
-    mKscaled = _ct(k_scaled, cutlass.BFloat16)
-    mKg = _ct(kg, cutlass.BFloat16)
-    mQscaled = _ct(q_scaled, cutlass.BFloat16)
-    mGkLast = _ct(gk_last, cutlass.Float32)
-    mAqk = _ct(A_qk, cutlass.BFloat16)
-    mAkk = _ct(A_kk, cutlass.BFloat16)
-
-    print("Compiling...")
-    compiled = cute.compile[KeepPTX, KeepCUBIN](
-        host_fn,
-        mQ, mK, mG, mA_log, mBeta, scale,
-        mKscaled, mKg, mQscaled, mGkLast, mAqk, mAkk,
+    ct_args = (
+        _ct(q, cutlass.BFloat16), _ct(k, cutlass.BFloat16),
+        _ct(g, cutlass.BFloat16), _ct(A_log, cutlass.Float32),
+        _ct(beta, cutlass.BFloat16), scale,
+        _ct(k_scaled, cutlass.BFloat16), _ct(kg, cutlass.BFloat16),
+        _ct(q_scaled, cutlass.BFloat16), _ct(gk_last, cutlass.Float32),
+        _ct(A_qk, cutlass.BFloat16), _ct(A_kk, cutlass.BFloat16),
     )
 
+    if keep_artifacts:
+        compiled = cute.compile[KeepPTX, KeepCUBIN](host_fn, *ct_args)
+    else:
+        compiled = cute.compile(host_fn, *ct_args)
+    return compiled, ct_args
+
+
+def _sass_analysis():
+    """Dump SASS and resource usage from the latest cubin."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    cubin_files = glob.glob(os.path.join(script_dir, "*.cubin"))
+    if not cubin_files:
+        cubin_files = glob.glob("*.cubin")
+    if not cubin_files:
+        print("  No cubin file found")
+        return
+
+    cubin_file = max(cubin_files, key=os.path.getmtime)
+    result = subprocess.run(["cuobjdump", "-sass", cubin_file],
+                            capture_output=True, text=True)
+    if result.returncode == 0:
+        sass_file = os.path.join(script_dir, "fuse_kernel123_8x2_ws.sass")
+        with open(sass_file, 'w') as f:
+            f.write(result.stdout)
+        stl = result.stdout.count("STL")
+        ldl = result.stdout.count("LDL")
+        print(f"  SASS: STL(spill store)={stl}, LDL(spill load)={ldl}")
+
+    result = subprocess.run(["cuobjdump", "-res-usage", cubin_file],
+                            capture_output=True, text=True)
+    if result.returncode == 0:
+        for line in result.stdout.split('\n'):
+            if any(kw in line.lower() for kw in ['reg', 'smem', 'stack']):
+                print(f"  {line.strip()}")
+
+
+# =========================================================================
+# --verify: Correctness verification (fused K1+K2 vs separate K1 → K2 → K3)
+# =========================================================================
+def verify(B=1, H=96, K=128, NT=128):
+    cutlass.cuda.initialize_cuda_context()
+    T = NT * BT
+    scale = 1.0 / (K ** 0.5)
+
+    print("=" * 72)
+    print("Correctness: fused K1+K2 vs reference K1 → K2 → K3")
+    print("=" * 72)
+    print(f"B={B}, T={T}, H={H}, K={K}, NT={NT}, BT={BT}, BC={BC}")
+    print()
+
+    torch.manual_seed(42)
+    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    g = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    A_log = torch.randn(H, device="cuda", dtype=torch.float32)
+    beta = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16)
+
+    # --- Reference K1 → K2 → K3 ---
+    print("[1/3] Running reference K1 → K2 → K3 ...")
+    g_cumsum, k_scaled_ref, kg_ref, q_scaled_ref, gk_last_ref = ref_k1(
+        g=g.contiguous(), k=k.contiguous(), q=q.contiguous(),
+        A_log=A_log.float().contiguous(), cumsum_scale=RCP_LN2, attn_scale=scale,
+    )
+
+    A_qk_ref = torch.zeros(B, T, H, BT, device="cuda", dtype=torch.bfloat16)
+    A_kkd_ref = torch.zeros(B, T, H, BC, device="cuda", dtype=torch.float32)
+    g_ct = _ct_ref(g_cumsum.contiguous(), cutlass.Float32)
+    q_ct = _ct_ref(q.contiguous(), cutlass.BFloat16)
+    k_ct = _ct_ref(k.contiguous(), cutlass.BFloat16)
+    b_ct = _ct_ref(beta.contiguous(), cutlass.BFloat16)
+    ak_ct = _ct_ref(A_kkd_ref, cutlass.Float32)
+    aq_ct = _ct_ref(A_qk_ref, cutlass.BFloat16)
+    du, di = _get_k2_ref_dummy(q.device)
+    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+    cache_key = (B, T, H, K, q.device.index or 0)
+    if cache_key not in _k2_ref_cache:
+        _k2_ref_cache[cache_key] = cute.compile(
+            ref_k2, g_ct, q_ct, k_ct, b_ct, ak_ct, aq_ct,
+            float(scale), stream, du, di, 0, cutlass.Int32(0))
+    _k2_ref_cache[cache_key](
+        g_ct, q_ct, k_ct, b_ct, ak_ct, aq_ct,
+        float(scale), stream, du, di, 0)
+    torch.cuda.synchronize()
+
+    A_kk_ref = torch.zeros(B, T, H, BT, device="cuda", dtype=torch.bfloat16)
+    ref_k3[(NT, B * H)](
+        q=q, k=k, g=g_cumsum, beta=beta,
+        Aqk=A_qk_ref, Akkd=A_kkd_ref, Akk=A_kk_ref,
+        scale=scale, cu_seqlens=None, chunk_indices=None,
+        T=T, H=H, K=K, BT=BT, BC=BC, USE_SAFE_GATE=True)
+    torch.cuda.synchronize()
+    print("      Done.")
+
+    # --- Fused K1+K2 ---
+    print("[2/3] Compiling + running fused kernel ...")
+    k_scaled_f = torch.empty(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    kg_f = torch.empty(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    q_scaled_f = torch.empty(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    gk_last_f = torch.empty(B, NT, H, K, device="cuda", dtype=torch.float32)
+    A_qk_f = torch.zeros(B, T, H, BT, device="cuda", dtype=torch.bfloat16)
+    A_kk_f = torch.zeros(B, T, H, BT, device="cuda", dtype=torch.bfloat16)
+
+    compiled, ct_args = _compile_fused(
+        B, NT, H, q, k, g, A_log, beta, scale,
+        k_scaled_f, kg_f, q_scaled_f, gk_last_f, A_qk_f, A_kk_f)
+    compiled(*ct_args)
+    torch.cuda.synchronize()
+    print("      Done.")
+
+    # --- Compare ---
+    print()
+    print("[3/3] Comparing outputs:")
+    print("  --- K1 outputs (fused vs ref_k1) ---")
+    _compare("k_scaled", k_scaled_ref, k_scaled_f)
+    _compare("q_scaled", q_scaled_ref, q_scaled_f)
+    _compare("kg", kg_ref, kg_f)
+    _compare("gk_last_exp", gk_last_ref, gk_last_f)
+
+    print("  --- K2+K3 outputs (fused vs ref_k1->k2->k3) ---")
+    _compare("A_qk", A_qk_ref, A_qk_f)
+    _compare("A_kk", A_kk_ref, A_kk_f)
+
+    print()
+    print("=" * 72)
+
+
+# =========================================================================
+# --bench: Performance benchmark (fused K1+K2 vs separate K1→K2→K3)
+# =========================================================================
+def bench(B=1, H=96, K=128, NT=128, num_warmup=20, num_iters=100):
+    cutlass.cuda.initialize_cuda_context()
+    T = NT * BT
+    scale = 1.0 / (K ** 0.5)
+
+    print("=" * 72)
+    print("Benchmark: separate K1+K2(+K3) vs fused K1+K2")
+    print("=" * 72)
+    print(f"B={B}, T={T}, H={H}, K={K}, NT={NT}")
+    print(f"Warmup={num_warmup}, Iters={num_iters}")
+    print()
+
+    torch.manual_seed(42)
+    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    g = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    A_log = torch.randn(H, device="cuda", dtype=torch.float32)
+    beta = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16)
+
+    # --- Compile reference K2 ---
+    print("Compiling reference K2...")
+    A_qk_ref = torch.zeros(B, T, H, BT, device="cuda", dtype=torch.bfloat16)
+    A_kkd_ref = torch.zeros(B, T, H, BC, device="cuda", dtype=torch.float32)
+    A_kk_ref = torch.zeros(B, T, H, BT, device="cuda", dtype=torch.bfloat16)
+
+    g_dummy = torch.randn(B, T, H, K, device="cuda", dtype=torch.float32)
+    g_ct = _ct_ref(g_dummy, cutlass.Float32)
+    q_ct = _ct_ref(q.contiguous(), cutlass.BFloat16)
+    k_ct = _ct_ref(k.contiguous(), cutlass.BFloat16)
+    b_ct = _ct_ref(beta.contiguous(), cutlass.BFloat16)
+    ak_ct = _ct_ref(A_kkd_ref, cutlass.Float32)
+    aq_ct = _ct_ref(A_qk_ref, cutlass.BFloat16)
+    du, di = _get_k2_ref_dummy(q.device)
+    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+    k2_compiled = cute.compile(
+        ref_k2, g_ct, q_ct, k_ct, b_ct, ak_ct, aq_ct,
+        float(scale), stream, du, di, 0, cutlass.Int32(0))
+
+    # --- Compile fused K1+K2 ---
+    print("Compiling fused K1+K2...")
+    k_scaled_f = torch.empty(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    kg_f = torch.empty(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    q_scaled_f = torch.empty(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    gk_last_f = torch.empty(B, NT, H, K, device="cuda", dtype=torch.float32)
+    A_qk_f = torch.empty(B, T, H, BT, device="cuda", dtype=torch.bfloat16)
+    A_kk_f = torch.empty(B, T, H, BT, device="cuda", dtype=torch.bfloat16)
+
+    compiled, ct_args = _compile_fused(
+        B, NT, H, q, k, g, A_log, beta, scale,
+        k_scaled_f, kg_f, q_scaled_f, gk_last_f, A_qk_f, A_kk_f,
+        keep_artifacts=True)
+
     try:
-        cubin_files = glob.glob(os.path.join(script_dir, "*.cubin"))
-        if not cubin_files:
-            cubin_files = glob.glob("*.cubin")
-        if cubin_files:
-            cubin_file = max(cubin_files, key=os.path.getmtime)
-            print(f"Found cubin: {cubin_file}")
-
-            result = subprocess.run(
-                ["cuobjdump", "-sass", cubin_file],
-                capture_output=True, text=True)
-            if result.returncode == 0:
-                sass_file = os.path.join(script_dir, "fuse_kernel123_all.sass")
-                with open(sass_file, 'w') as f:
-                    f.write(result.stdout)
-                print(f"SASS saved to: {sass_file}")
-                total_lines = result.stdout.count('\n')
-                stl_count = result.stdout.count("STL")
-                ldl_count = result.stdout.count("LDL")
-                print(f"SASS stats: {total_lines} lines, "
-                      f"STL(spill store)={stl_count}, LDL(spill load)={ldl_count}")
-
-            result = subprocess.run(
-                ["cuobjdump", "-res-usage", cubin_file],
-                capture_output=True, text=True)
-            if result.returncode == 0:
-                print("\nResource usage:")
-                for line in result.stdout.split('\n'):
-                    if any(kw in line.lower() for kw in ['reg', 'smem', 'stack', 'spill']):
-                        print(f"  {line}")
-        else:
-            print("No cubin file found for SASS dump")
+        _sass_analysis()
     except Exception as e:
-        print(f"Could not generate SASS: {e}")
+        print(f"  SASS analysis failed: {e}")
+    print()
 
-    print("\nRunning...")
-    compiled(mQ, mK, mG, mA_log, mBeta, scale,
-             mKscaled, mKg, mQscaled, mGkLast, mAqk, mAkk)
-    torch.cuda.synchronize()
-    print("Kernel executed successfully!")
+    def run_ref_k12():
+        g_cumsum, _, _, _, _ = ref_k1(
+            g=g.contiguous(), k=k.contiguous(), q=q.contiguous(),
+            A_log=A_log.float().contiguous(), cumsum_scale=RCP_LN2, attn_scale=scale)
+        g_ct_live = _ct_ref(g_cumsum.contiguous(), cutlass.Float32)
+        k2_compiled(g_ct_live, q_ct, k_ct, b_ct, ak_ct, aq_ct,
+                    float(scale), stream, du, di, 0)
 
-    num_warmup, num_iters = 1, 1
+    def run_ref_k123():
+        g_cumsum, _, _, _, _ = ref_k1(
+            g=g.contiguous(), k=k.contiguous(), q=q.contiguous(),
+            A_log=A_log.float().contiguous(), cumsum_scale=RCP_LN2, attn_scale=scale)
+        g_ct_live = _ct_ref(g_cumsum.contiguous(), cutlass.Float32)
+        k2_compiled(g_ct_live, q_ct, k_ct, b_ct, ak_ct, aq_ct,
+                    float(scale), stream, du, di, 0)
+        ref_k3[(NT, B * H)](
+            q=q, k=k, g=g_cumsum, beta=beta,
+            Aqk=A_qk_ref, Akkd=A_kkd_ref, Akk=A_kk_ref,
+            scale=scale, cu_seqlens=None, chunk_indices=None,
+            T=T, H=H, K=K, BT=BT, BC=BC, USE_SAFE_GATE=True)
 
+    def run_fused():
+        compiled(*ct_args)
+
+    # --- Warmup ---
+    print("Warming up...")
     for _ in range(num_warmup):
-        compiled(mQ, mK, mG, mA_log, mBeta, scale,
-                 mKscaled, mKg, mQscaled, mGkLast, mAqk, mAkk)
+        run_ref_k12()
+    torch.cuda.synchronize()
+    for _ in range(num_warmup):
+        run_ref_k123()
+    torch.cuda.synchronize()
+    for _ in range(num_warmup):
+        run_fused()
     torch.cuda.synchronize()
 
-    start = time.perf_counter()
+    # --- Timing (CUDA events) ---
+    start_ev = torch.cuda.Event(enable_timing=True)
+    end_ev = torch.cuda.Event(enable_timing=True)
+
+    start_ev.record()
     for _ in range(num_iters):
-        compiled(mQ, mK, mG, mA_log, mBeta, scale,
-                 mKscaled, mKg, mQscaled, mGkLast, mAqk, mAkk)
+        run_ref_k12()
+    end_ev.record()
     torch.cuda.synchronize()
-    elapsed_us = (time.perf_counter() - start) / num_iters * 1e6
+    ref_k12_us = start_ev.elapsed_time(end_ev) / num_iters * 1000
+
+    start_ev.record()
+    for _ in range(num_iters):
+        run_ref_k123()
+    end_ev.record()
+    torch.cuda.synchronize()
+    ref_k123_us = start_ev.elapsed_time(end_ev) / num_iters * 1000
+
+    start_ev.record()
+    for _ in range(num_iters):
+        run_fused()
+    end_ev.record()
+    torch.cuda.synchronize()
+    fused_us = start_ev.elapsed_time(end_ev) / num_iters * 1000
+
+    # --- Report ---
+    print()
+    print(f"{'Results':^72}")
+    print("-" * 72)
+    print(f"  Separate K1+K2:        {ref_k12_us:>8.1f} us")
+    print(f"  Separate K1+K2+K3:     {ref_k123_us:>8.1f} us")
+    print(f"  Fused K1+K2:           {fused_us:>8.1f} us")
+    print(f"  Speedup vs K1+K2:      {ref_k12_us / fused_us:>8.2f}x")
+    print(f"  Speedup vs K1+K2+K3:   {ref_k123_us / fused_us:>8.2f}x")
+    print("-" * 72)
 
     read_bytes = B * T * H * K * 2 * 3 + H * 4 + B * T * H * 2
     write_bytes = (B * T * H * K * 2 * 3
                    + B * NT * H * K * 4
                    + B * T * H * BT * 2 * 2)
     total_bytes = read_bytes + write_bytes
-    bw = total_bytes / (elapsed_us * 1e-6) / 1e9
+    bw = total_bytes / (fused_us * 1e-6) / 1e9
 
-    print(f"\n[Benchmark] {num_iters} iterations")
-    print(f"  Kernel time: {elapsed_us:.2f} us")
-    print(f"  Read:  {read_bytes / 1e6:.1f} MB")
-    print(f"  Write: {write_bytes / 1e6:.1f} MB")
-    print(f"  Total: {total_bytes / 1e6:.1f} MB")
-    print(f"  Bandwidth: {bw:.1f} GB/s")
-    print(f"  Utilization: {bw / B200_PEAK_BW_GBS * 100:.1f}% of B200 peak ({B200_PEAK_BW_GBS} GB/s)")
-    print("=" * 60)
+    print(f"  Fused IO: {total_bytes / 1e6:.1f} MB  BW: {bw:.1f} GB/s "
+          f"({bw / B200_PEAK_BW_GBS * 100:.1f}% of {B200_PEAK_BW_GBS} GB/s)")
+    print("=" * 72)
 
 
 if __name__ == "__main__":
-    test()
+    import argparse
+    parser = argparse.ArgumentParser(description="Fused K1+K2 kernel test (8x2 warp-specialized)")
+    parser.add_argument("--verify", action="store_true", help="Correctness verification")
+    parser.add_argument("--bench", action="store_true", help="Performance benchmark")
+    args = parser.parse_args()
+
+    if not args.verify and not args.bench:
+        args.verify = True
+        args.bench = True
+
+    if args.verify:
+        verify()
+        print()
+    if args.bench:
+        bench()
 
