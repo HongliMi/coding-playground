@@ -65,6 +65,7 @@ import cuda.bindings.driver as cuda_drv
 from act_cumsum_scale_fused_cute import act_cumsum_scale_fused_v2_vec as ref_k1
 from intra_parellel_cute import run_kda_Akk as ref_k2
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_kernel_inter_solve_fused as ref_k3
+from solve_tril_cute_v2 import solve_tril_host_v2
 
 B200_PEAK_BW_GBS = 7672  # GB/s
 
@@ -979,18 +980,48 @@ def verify(B=1, H=96, K=128, NT=128):
     torch.cuda.synchronize()
     print("      Done.")
 
+    # --- Invert A_kk using solve_tril ---
+    print("[3/4] Inverting A_kk via solve_tril ...")
+    # Reshape [B, T, H, BT] → [B, NT, BT, H, BT] → [B*NT*H, BT, BT]
+    A_kk_batch = (A_kk_f
+                  .view(B, NT, BT, H, BT)
+                  .permute(0, 1, 3, 2, 4)
+                  .contiguous()
+                  .reshape(-1, BT, BT))
+    batch_size = A_kk_batch.shape[0]
+
+    A_kk_in = A_kk_batch.tril(-1).to(torch.float16).contiguous()
+    A_kk_inv = torch.zeros_like(A_kk_in)
+
+    A_kk_in_ct = from_dlpack(A_kk_in, assumed_align=16)
+    A_kk_inv_ct = from_dlpack(A_kk_inv, assumed_align=16)
+
+    solve_compiled = cute.compile(
+        solve_tril_host_v2, A_kk_in_ct, A_kk_inv_ct, batch_size)
+    solve_compiled(A_kk_in_ct, A_kk_inv_ct)
+    torch.cuda.synchronize()
+
+    # Reshape back: [B*NT*H, BT, BT] → [B, T, H, BT]
+    A_kk_inv_bf16 = (A_kk_inv
+                     .to(torch.bfloat16)
+                     .reshape(B, NT, H, BT, BT)
+                     .permute(0, 1, 3, 2, 4)
+                     .contiguous()
+                     .reshape(B, T, H, BT))
+    print("      Done.")
+
     # --- Compare ---
     print()
-    print("[3/3] Comparing outputs:")
+    print("[4/4] Comparing outputs:")
     print("  --- K1 outputs (fused vs ref_k1) ---")
     _compare("k_scaled", k_scaled_ref, k_scaled_f)
     _compare("q_scaled", q_scaled_ref, q_scaled_f)
     _compare("kg", kg_ref, kg_f)
     _compare("gk_last_exp", gk_last_ref, gk_last_f)
 
-    print("  --- K2+K3 outputs (fused vs ref_k1->k2->k3) ---")
+    print("  --- K2+K3 outputs (fused+solve_tril vs ref_k1->k2->k3) ---")
     _compare("A_qk", A_qk_ref, A_qk_f)
-    _compare("A_kk", A_kk_ref, A_kk_f)
+    _compare("A_kk", A_kk_ref, A_kk_inv_bf16)
 
     print()
     print("=" * 72)
