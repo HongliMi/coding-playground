@@ -25,8 +25,8 @@ Stages:
   4. Warps 0+1+2 → Ai30 (sTemp aggregation)
   5. All warps: convert fp32 → bf16, store to global
 
-Inputs:  A_in  [batch, 64, 64] fp32 (block-transposed layout)
-Outputs: A_out [batch, 64, 64] bf16
+Inputs:  A_in  [B, T, H, BT] fp32 (block-transposed layout, T = NT * BT)
+Outputs: A_out [B*NT*H, 64, 64] bf16
 """
 
 import cutlass
@@ -370,13 +370,15 @@ def akk_inv_kernel(
     mOut: cute.Tensor,
     akk_smem_layout,
     temp_layout: cute.Layout,
-    batch_size: int,
+    NT: int,
+    H: int,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
     lane_id = tidx % 32
-    batch_idx, _, _ = cute.arch.block_idx()
+    h_idx, nt_idx, b_idx = cute.arch.block_idx()
+    batch_idx = b_idx * (NT * H) + nt_idx * H + h_idx
 
     # ===== SMEM allocation =====
     smem = cutlass.utils.SmemAllocator()
@@ -394,8 +396,8 @@ def akk_inv_kernel(
     cute.arch.barrier()
 
     # ===== Stage 0: TMA Load fp32 64×64 → sAkk =====
-    # Global view is (BS, BS, batch); select batch, then single tile
-    gA_batch = tma_load_tensor[(None, None, batch_idx)]
+    # Global view is (BS, BS, H, NT, B); select (h, nt, b), then single tile
+    gA_batch = tma_load_tensor[(None, None, h_idx, nt_idx, b_idx)]
     gA_tile = cute.local_tile(gA_batch, (BS, BS), (0, 0))
 
     if warp_idx == 0:
@@ -542,14 +544,14 @@ def akk_inv_kernel(
 
     cute.arch.barrier()
 
-    # ===== Stage 5: Store sAkk fp32 → bf16 to global =====
+    # ===== Stage 5: Store sAkk fp32 → bf16 to global (lower triangle only) =====
     row_start = warp_idx * SB
     for ri in cutlass.range_constexpr(SB):
         row = row_start + ri
         c0 = lane_id * 2
         c1 = lane_id * 2 + 1
-        v0 = cutlass.Float32(sAkk[row, c0])
-        v1 = cutlass.Float32(sAkk[row, c1])
+        v0 = cutlass.Float32(sAkk[row, c0]) * cutlass.Float32(row >= c0)
+        v1 = cutlass.Float32(sAkk[row, c1]) * cutlass.Float32(row >= c1)
         mOut[batch_idx, row, c0] = v0.to(cutlass.BFloat16)
         mOut[batch_idx, row, c1] = v1.to(cutlass.BFloat16)
 
@@ -561,11 +563,14 @@ def akk_inv_kernel(
 def akk_inv_host(
     A_in: cute.Tensor,
     A_out: cute.Tensor,
-    batch_size: cutlass.Constexpr[int],
+    B: cutlass.Constexpr[int],
+    NT: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
 ):
+    T = NT * BS
     view_layout = cute.make_layout(
-        (BS, BS, batch_size),
-        stride=(BS, 1, BS * BS))
+        (BS, BS, H, NT, B),
+        stride=(H * BS, 1, BS, BS * H * BS, T * H * BS))
     akk_view = cute.make_tensor(A_in.iterator, view_layout)
 
     sw = cute.make_swizzle(2, 5, 2)
@@ -588,9 +593,9 @@ def akk_inv_host(
 
     akk_inv_kernel(
         tma_load_atom, tma_load_tensor, A_out,
-        akk_smem_2d, temp_layout, batch_size,
+        akk_smem_2d, temp_layout, NT, H,
     ).launch(
-        grid=(batch_size, 1, 1),
+        grid=(H, NT, B),
         block=(THREADS, 1, 1),
         smem=smem_bytes,
     )
@@ -621,23 +626,37 @@ def prepare_input(M):
 def test_akk_inv():
     cutlass.cuda.initialize_cuda_context()
 
-    BATCH = 96 * 128
+    B_TEST = 1
+    H_TEST = 1
+    NT_TEST = 96 * 128
+    T_TEST = NT_TEST * BS
+    inv_batch = B_TEST * NT_TEST * H_TEST
     WARMUP = 5
     BENCH = 100
 
     print("=" * 60)
     print("Akk 64×64 Inverse — TF32 MMA, FP32 SMEM")
     print("=" * 60)
-    print(f"  Batch: {BATCH},  Matrix: {BS}×{BS},  Threads: {THREADS}")
+    print(f"  B={B_TEST}, NT={NT_TEST}, H={H_TEST}, T={T_TEST}")
+    print(f"  inv_batch={inv_batch},  Matrix: {BS}×{BS},  Threads: {THREADS}")
 
     torch.manual_seed(42)
 
-    L = torch.randn(BATCH, BS, BS, device="cuda", dtype=torch.float32) * 0.1
+    L = torch.randn(inv_batch, BS, BS, device="cuda", dtype=torch.float32) * 0.1
     L = L.tril(-1)
     M = torch.eye(BS, device="cuda", dtype=torch.float32).unsqueeze(0) + L
 
-    M_input = prepare_input(M).contiguous()
-    M_out = torch.zeros(BATCH, BS, BS, device="cuda", dtype=torch.bfloat16)
+    M_bt = prepare_input(M)  # [inv_batch, 64, 64] block-transposed
+
+    # Reshape [inv_batch, BT, BT] → [B, T, H, BT] matching fused kernel output layout
+    # batch_idx = b * NT * H + nt * H + h
+    M_input = (M_bt
+               .reshape(B_TEST, NT_TEST, H_TEST, BS, BS)
+               .permute(0, 1, 3, 2, 4)
+               .contiguous()
+               .reshape(B_TEST, T_TEST, H_TEST, BS))
+
+    M_out = torch.zeros(inv_batch, BS, BS, device="cuda", dtype=torch.bfloat16)
 
     M_in_ct = from_dlpack(M_input, assumed_align=16)
     M_in_ct.element_type = cutlass.Float32
@@ -645,7 +664,7 @@ def test_akk_inv():
     M_out_ct.element_type = cutlass.BFloat16
 
     print("\nCompiling ...")
-    compiled = cute.compile(akk_inv_host, M_in_ct, M_out_ct, BATCH)
+    compiled = cute.compile(akk_inv_host, M_in_ct, M_out_ct, B_TEST, NT_TEST, H_TEST)
     torch.cuda.synchronize()
     print("Done.")
 
@@ -692,7 +711,7 @@ def test_akk_inv():
     end.record()
     torch.cuda.synchronize()
     ms = start.elapsed_time(end) / BENCH
-    data_mb = BATCH * BS * BS * (4 + 2) / 1e6
+    data_mb = inv_batch * BS * BS * (4 + 2) / 1e6
     bw = data_mb / ms * 1e3 / 1e3
     print(f"  Time: {ms:.4f} ms   BW: {bw:.1f} GB/s")
     print("=" * 60)
