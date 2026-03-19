@@ -378,7 +378,6 @@ def akk_inv_kernel(
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
     lane_id = tidx % 32
     h_idx, nt_idx, b_idx = cute.arch.block_idx()
-    batch_idx = b_idx * (NT * H) + nt_idx * H + h_idx
 
     # ===== SMEM allocation =====
     smem = cutlass.utils.SmemAllocator()
@@ -544,16 +543,17 @@ def akk_inv_kernel(
 
     cute.arch.barrier()
 
-    # ===== Stage 5: Store sAkk fp32 → bf16 to global (lower triangle only) =====
+    # ===== Stage 5: Store sAkk fp32 → bf16 to global [B, T, H, BT] =====
     row_start = warp_idx * SB
     for ri in cutlass.range_constexpr(SB):
         row = row_start + ri
+        t_row = nt_idx * BS + row
         c0 = lane_id * 2
         c1 = lane_id * 2 + 1
         v0 = cutlass.Float32(sAkk[row, c0]) * cutlass.Float32(row >= c0)
         v1 = cutlass.Float32(sAkk[row, c1]) * cutlass.Float32(row >= c1)
-        mOut[batch_idx, row, c0] = v0.to(cutlass.BFloat16)
-        mOut[batch_idx, row, c1] = v1.to(cutlass.BFloat16)
+        mOut[b_idx, t_row, h_idx, c0] = v0.to(cutlass.BFloat16)
+        mOut[b_idx, t_row, h_idx, c1] = v1.to(cutlass.BFloat16)
 
 
 # ===========================================================================
@@ -627,8 +627,8 @@ def test_akk_inv():
     cutlass.cuda.initialize_cuda_context()
 
     B_TEST = 1
-    H_TEST = 1
-    NT_TEST = 96 * 128
+    H_TEST = 96
+    NT_TEST = 128
     T_TEST = NT_TEST * BS
     inv_batch = B_TEST * NT_TEST * H_TEST
     WARMUP = 5
@@ -648,15 +648,14 @@ def test_akk_inv():
 
     M_bt = prepare_input(M)  # [inv_batch, 64, 64] block-transposed
 
-    # Reshape [inv_batch, BT, BT] → [B, T, H, BT] matching fused kernel output layout
-    # batch_idx = b * NT * H + nt * H + h
+    # Reshape [inv_batch, BT, BT] → [B, T, H, BT] matching fused kernel output
     M_input = (M_bt
                .reshape(B_TEST, NT_TEST, H_TEST, BS, BS)
                .permute(0, 1, 3, 2, 4)
                .contiguous()
                .reshape(B_TEST, T_TEST, H_TEST, BS))
 
-    M_out = torch.zeros(inv_batch, BS, BS, device="cuda", dtype=torch.bfloat16)
+    M_out = torch.zeros(B_TEST, T_TEST, H_TEST, BS, device="cuda", dtype=torch.bfloat16)
 
     M_in_ct = from_dlpack(M_input, assumed_align=16)
     M_in_ct.element_type = cutlass.Float32
@@ -680,7 +679,13 @@ def test_akk_inv():
     M_inv_ref = torch.linalg.inv(M)
     mask = torch.tril(torch.ones(BS, BS, device="cuda", dtype=torch.bool))
 
-    out_f = M_out.float()
+    # Reshape output [B, T, H, BT] → [inv_batch, BT, BT] for comparison
+    out_3d = (M_out
+              .reshape(B_TEST, NT_TEST, BS, H_TEST, BS)
+              .permute(0, 1, 3, 2, 4)
+              .contiguous()
+              .reshape(inv_batch, BS, BS))
+    out_f = out_3d.float()
     ref_f = M_inv_ref.float()
     diff = (out_f - ref_f).abs()
     diff_lower = diff[:, mask]
@@ -701,8 +706,8 @@ def test_akk_inv():
             blk = diff[:, i * SB:(i + 1) * SB, j * SB:(j + 1) * SB]
             print(f"  Block({i},{j}): max={blk.max().item():.6e}")
 
-    # --- Benchmark ---
-    print(f"\nBenchmark ({BENCH} iters) ...")
+    # --- Benchmark (warm L2) ---
+    print(f"\nBenchmark warm L2 ({BENCH} iters) ...")
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -714,6 +719,21 @@ def test_akk_inv():
     data_mb = inv_batch * BS * BS * (4 + 2) / 1e6
     bw = data_mb / ms * 1e3 / 1e3
     print(f"  Time: {ms:.4f} ms   BW: {bw:.1f} GB/s")
+
+    # --- Benchmark (cold L2) ---
+    l2_flush = torch.empty(64 * 1024 * 1024, device="cuda", dtype=torch.int8)
+    print(f"\nBenchmark cold L2 ({BENCH} iters) ...")
+    start.record()
+    for _ in range(BENCH):
+        l2_flush.fill_(0)
+        compiled(M_in_ct, M_out_ct)
+    end.record()
+    torch.cuda.synchronize()
+    ms_cold = start.elapsed_time(end) / BENCH
+    data_mb = inv_batch * BS * BS * (4 + 2) / 1e6
+    bw_cold = data_mb / ms_cold * 1e3 / 1e3
+    print(f"  Time: {ms_cold:.4f} ms   BW: {bw_cold:.1f} GB/s")
+    print(f"\n  Delta (cold - warm): {(ms_cold - ms) * 1000:.1f} us")
     print("=" * 60)
 
 

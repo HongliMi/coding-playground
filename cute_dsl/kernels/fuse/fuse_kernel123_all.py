@@ -672,8 +672,6 @@ def fused_kernel123(
                 akk_smem_cb = _TILE_IQ[tile_idx] * BC
                 gmem_aqk_row = chunk_start + i_q * BC
                 gmem_aqk_col = i_k * BC
-                gmem_akk_row = chunk_start + i_k * BC
-                gmem_akk_col = i_q * BC
 
                 for ri in cutlass.range_constexpr(BC // NUM_STORE_WARPS):
                     local_row = store_warp * (BC // NUM_STORE_WARPS) + ri
@@ -684,10 +682,11 @@ def fused_kernel123(
 
                         if is_diag and local_row < local_col:
                             aqk_val = cutlass.BFloat16(0.0)
+                        if is_diag and local_row <= local_col:
                             akk_val_f32 = cutlass.Float32(0.0)
 
                         mAqk[i_b, gmem_aqk_row + local_row, i_h, gmem_aqk_col + local_col] = aqk_val
-                        mAkk[i_b, gmem_akk_row + local_row, i_h, gmem_akk_col + local_col] = akk_val_f32
+                        mAkk[i_b, chunk_start + i_k * BC + local_row, i_h, i_q * BC + local_col] = akk_val_f32
 
             cute.arch.mbarrier_arrive(store_done_mbars + s)
 
@@ -939,7 +938,8 @@ def verify(B=1, H=96, K=128, NT=128):
 
     torch.manual_seed(42)
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    k = torch.nn.functional.normalize(
+        torch.randn(B, T, H, K, device="cuda"), dim=-1).to(torch.bfloat16)
     g = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
     A_log = torch.randn(H, device="cuda", dtype=torch.float32)
     beta = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16)
@@ -998,22 +998,14 @@ def verify(B=1, H=96, K=128, NT=128):
 
     # --- Invert A_kk using akk_inv ---
     print("[3/4] Inverting A_kk via akk_inv ...")
-    # A_kk_f is [B, T, H, BT] fp32 — directly matches akk_inv_host input
-    inv_batch = B * NT * H
-    A_kk_inv = torch.zeros(inv_batch, BT, BT, device="cuda", dtype=torch.bfloat16)
+    # A_kk_f is [B, T, H, BT] fp32, akk_inv outputs [B, T, H, BT] bf16
+    A_kk_inv_bf16 = torch.zeros(B, T, H, BT, device="cuda", dtype=torch.bfloat16)
     A_kk_in_ct = _ct_ref(A_kk_f, cutlass.Float32)
-    A_kk_inv_ct = _ct_ref(A_kk_inv, cutlass.BFloat16)
+    A_kk_inv_ct = _ct_ref(A_kk_inv_bf16, cutlass.BFloat16)
 
     akk_compiled = cute.compile(akk_inv_host, A_kk_in_ct, A_kk_inv_ct, B, NT, H)
     akk_compiled(A_kk_in_ct, A_kk_inv_ct)
     torch.cuda.synchronize()
-
-    # akk_inv output is [inv_batch, BT, BT] with upper tri already zeroed by kernel
-    A_kk_inv_bf16 = (A_kk_inv
-                     .reshape(B, NT, H, BT, BT)
-                     .permute(0, 1, 3, 2, 4)
-                     .contiguous()
-                     .reshape(B, T, H, BT))
     print("      Done.")
 
     # --- Compare ---
@@ -1050,7 +1042,8 @@ def bench(B=1, H=96, K=128, NT=128, num_warmup=20, num_iters=100):
 
     torch.manual_seed(42)
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    k = torch.nn.functional.normalize(
+        torch.randn(B, T, H, K, device="cuda"), dim=-1).to(torch.bfloat16)
     g = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
     A_log = torch.randn(H, device="cuda", dtype=torch.float32)
     beta = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16)
@@ -1081,7 +1074,7 @@ def bench(B=1, H=96, K=128, NT=128, num_warmup=20, num_iters=100):
     q_scaled_f = torch.empty(B, T, H, K, device="cuda", dtype=torch.bfloat16)
     gk_last_f = torch.empty(B, NT, H, K, device="cuda", dtype=torch.float32)
     A_qk_f = torch.empty(B, T, H, BT, device="cuda", dtype=torch.bfloat16)
-    A_kk_f = torch.empty(B, T, H, BT, device="cuda", dtype=torch.float32)
+    A_kk_f = torch.zeros(B, T, H, BT, device="cuda", dtype=torch.float32)
 
     compiled, ct_args = _compile_fused(
         B, NT, H, q, k, g, A_log, beta, scale,
@@ -1095,8 +1088,7 @@ def bench(B=1, H=96, K=128, NT=128, num_warmup=20, num_iters=100):
 
     # --- Compile akk_inv ---
     print("Compiling akk_inv...")
-    inv_batch = B * NT * H
-    A_kk_inv_out = torch.zeros(inv_batch, BT, BT, device="cuda", dtype=torch.bfloat16)
+    A_kk_inv_out = torch.zeros(B, T, H, BT, device="cuda", dtype=torch.bfloat16)
     akk_in_ct = _ct_ref(A_kk_f, cutlass.Float32)
     akk_out_ct = _ct_ref(A_kk_inv_out, cutlass.BFloat16)
     akk_compiled = cute.compile(akk_inv_host, akk_in_ct, akk_out_ct, B, NT, H)
@@ -1197,8 +1189,8 @@ def bench(B=1, H=96, K=128, NT=128, num_warmup=20, num_iters=100):
     total_fused = read_bytes + write_bytes_fused
     bw_fused = total_fused / (fused_us * 1e-6) / 1e9
 
-    # akk_inv reads fp32 64×64 + writes bf16 64×64 per batch element
-    inv_io = inv_batch * BT * BT * (4 + 2)
+    # akk_inv reads [B,T,H,BT] fp32 + writes [B,T,H,BT] bf16
+    inv_io = B * T * H * BT * (4 + 2)
     total_k123 = total_fused + inv_io
     bw_k123 = total_k123 / (fused_k123_us * 1e-6) / 1e9
 
