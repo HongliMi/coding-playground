@@ -430,6 +430,20 @@ def fused_kernel123(
                     for vi in cutlass.range_constexpr(VEC):
                         rPrefix[vi] = sPartialLast[warp_row_group - 1, col_base + vi]
 
+                # ---- Pass 2a: ONLY cumsum + write csGcum (critical path, minimal work) ----
+                for vi in cutlass.range_constexpr(VEC):
+                    rAcc[vi] = rPrefix[vi]
+
+                for ri in cutlass.range_constexpr(ROWS_PER_K1_WARP):
+                    row = k1_row_start + ri
+                    for vi in cutlass.range_constexpr(VEC):
+                        rAcc[vi] = rAcc[vi] + rGact[ri, vi]
+                        csGcum[row, col_base + vi] = rAcc[vi] * cumsum_scale
+
+                # Signal MMA early: csGcum is ready
+                cute.arch.mbarrier_arrive(k1_done_mbars + cur_stage)
+
+                # ---- Pass 2b: recompute + write GMEM (overlaps with MMA, off critical path) ----
                 for vi in cutlass.range_constexpr(VEC):
                     rAcc[vi] = rPrefix[vi]
 
@@ -450,15 +464,16 @@ def fused_kernel123(
                     cute.copy(tiled_copy_qk_k1, tCsQ, thr_copy_k1.retile(tCrQ))
 
                     for vi in cutlass.range_constexpr(VEC):
-                        c = col_base + vi
                         rAcc[vi] = rAcc[vi] + rGact[ri, vi]
                         cs = rAcc[vi] * cumsum_scale
+
                         k_val = tCrK[vi].to(cutlass.Float32)
                         q_val = tCrQ[vi].to(cutlass.Float32)
+
                         exp2_cs = cute.exp2(cs, fastmath=True)
                         gk_last_cs = rGkLast[vi] * cumsum_scale
                         exp2_kg = cute.exp2(gk_last_cs - cs, fastmath=True)
-                        csGcum[row, c] = cs
+
                         rKsOut[vi] = (k_val * exp2_cs).to(cutlass.BFloat16)
                         rQsOut[vi] = (q_val * exp2_cs * scale).to(cutlass.BFloat16)
                         rKgOut[vi] = (k_val * exp2_kg).to(cutlass.BFloat16)
@@ -471,8 +486,6 @@ def fused_kernel123(
                     for vi in cutlass.range_constexpr(VEC):
                         rGkOut[vi] = cute.exp2(rGkLast[vi] * cumsum_scale, fastmath=True)
                     cute.autovec_copy(rGkOut, mGkLast[i_b, chunk_idx, i_h, col_vec_idx, None])
-
-                cute.arch.mbarrier_arrive(k1_done_mbars + cur_stage)
 
         # =============================================================
         # Warps 16-27: K2 MMA Compute
@@ -605,6 +618,9 @@ def fused_kernel123(
                             ka0, ka1, ka2, ka3, k_n1_b0, k_n1_b1,
                             acc_akk_n1_0, acc_akk_n1_1, acc_akk_n1_2, acc_akk_n1_3)
 
+                    # sQ/sK/sG reads done, signal TMA before SMEM writes
+                    cute.arch.mbarrier_arrive(stage_reuse_mbars + s)
+
                     csAqk[row0, tile_col_base + col0] = (acc_aqk_n0_0 * scale).to(cutlass.BFloat16)
                     csAqk[row0, tile_col_base + col1] = (acc_aqk_n0_1 * scale).to(cutlass.BFloat16)
                     csAqk[row1, tile_col_base + col0] = (acc_aqk_n0_2 * scale).to(cutlass.BFloat16)
@@ -622,9 +638,10 @@ def fused_kernel123(
                     csAkk[akk_row_base + row0, akk_col_base + col3] = acc_akk_n1_1 * beta_row0
                     csAkk[akk_row_base + row1, akk_col_base + col2] = acc_akk_n1_2 * beta_row1
                     csAkk[akk_row_base + row1, akk_col_base + col3] = acc_akk_n1_3 * beta_row1
+                else:
+                    cute.arch.mbarrier_arrive(stage_reuse_mbars + s)
 
                 cute.arch.mbarrier_arrive(mma_done_mbars + s)
-                cute.arch.mbarrier_arrive(stage_reuse_mbars + s)
 
         # =============================================================
         # Warps 28-31: Store/Inversion warps
