@@ -1,14 +1,18 @@
 """
 Akk 64×64 Lower Triangular Block Inversion — TF32 MMA, FP32 SMEM.
 
+Non-swizzled padded SMEM layout (stride 72, 8-col padding) for bank-conflict
+reduction.  Global→SMEM via cp.async (128-bit vectorised).  All subsequent
+SMEM accesses are direct scalar indexing inside dsl_user_op functions so that
+loads and MMA compile in the same unit for optimal instruction scheduling.
+
 Architecture:
   - 4 warps (128 threads) per CTA, each CTA processes one 64×64 Akk matrix
-  - sAkk [64,64] fp32 with swizzle<2,5,2>: input in UPPER triangle (block-transposed),
-    output written to LOWER triangle → no read/write conflicts
+  - sAkk [64,64] fp32 with stride 72 (8 padding cols per row)
   - sTemp [16, 24, 2] fp32: inter-warp communication buffer (C-layout only)
   - C→B layout conversion via warp shuffles (16 shfl + 8 selp, no SMEM)
   - TF32 MMA m16n8k8 for all 16×16 block matmuls, FP32 accumulators
-  - Diagonal inversion via anti-diagonal sweep with shuffles
+  - Diagonal inversion via anti-diagonal sweep with shuffles (in-place on sAkk)
 
 Block layout in sAkk (4×4 sub-blocks of 16×16):
   Upper tri = INPUT, Diagonal = in-place inversion, Lower tri = OUTPUT
@@ -19,14 +23,15 @@ Block layout in sAkk (4×4 sub-blocks of 16×16):
   row 48-63: [Ai30]        [Ai31]       [Ai32]       [Akk33→Ai33]
 
 Stages:
-  1. TMA load fp32 64×64 → sAkk; warps 0-1 invert 4 diagonal blocks
+  0. cp.async load fp32 64×64 → sAkk
+  1. Invert 4 diagonal blocks in-place on sAkk
   2. Warps 0-2: Ai10, Ai21, Ai32 via chain MMA (C→A swap)
   3. Warps 0+2 → Ai20, warps 1+3 → Ai31 (parallel pairs, sTemp)
   4. Warps 0+1+2 → Ai30 (sTemp aggregation)
-  5. All warps: convert fp32 → bf16, store to global
+  5. All warps: load fp32 → bf16, store to global
 
 Inputs:  A_in  [B, T, H, BT] fp32 (block-transposed layout, T = NT * BT)
-Outputs: A_out [B*NT*H, 64, 64] bf16
+Outputs: A_out [B, T, H, BT] bf16
 """
 
 import cutlass
@@ -47,6 +52,8 @@ THREADS = 128
 TEMP_PAD = 8
 TEMP_COLS = SB + TEMP_PAD   # 24
 NUM_TEMPS = 2
+AKK_PAD = 8
+AKK_STRIDE = BS + AKK_PAD   # 72
 
 
 # ===========================================================================
@@ -90,11 +97,11 @@ def mma_tf32_m16n8k8(
 # Diagonal 16×16 unit-lower-triangular inversion (half-warp, in-place)
 # ===========================================================================
 @dsl_user_op
-def _invert_diag(sAkk: cute.Tensor, diag_offset, lane_id, *, loc=None, ip=None):
-    """Anti-diagonal sweep: reads lower-tri from sAkk, writes inverse back."""
+def _invert_diag(sAkk: cute.Tensor, block_rc, lane_id, *, loc=None, ip=None):
     my_row = lane_id % 16
     halfwarp_base = (lane_id // 16) * 16
-    off = diag_offset
+    r_off = block_rc * 16
+    c_off = block_rc * 16
 
     rInv = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), cutlass.Float32)
     rInv[0] = cutlass.Float32(1.0)
@@ -104,179 +111,156 @@ def _invert_diag(sAkk: cute.Tensor, diag_offset, lane_id, *, loc=None, ip=None):
     for d in range(1, 16):
         col_d = my_row - d
         valid = cutlass.Float32(col_d >= 0)
-        a_val = cutlass.Float32(sAkk[off + my_row, off + col_d]) * valid
+        a_val = cutlass.Float32(sAkk[r_off + my_row, c_off + col_d]) * valid
         acc = cutlass.Float32(0.0)
         for j in range(1, d):
-            a_re = cutlass.Float32(sAkk[off + my_row, off + my_row - (d - j)])
+            a_re = cutlass.Float32(sAkk[r_off + my_row, c_off + my_row - (d - j)])
             inv_shfl = cute.arch.shuffle_sync(rInv[j], halfwarp_base + my_row - d + j)
             acc = acc + a_re * inv_shfl
         rInv[d] = (-a_val - acc) * valid
 
     rInv[0] = cutlass.Float32(1.0)
-    sAkk[off + my_row, off + my_row] = rInv[0]
+    sAkk[r_off + my_row, c_off + my_row] = rInv[0]
     for d in range(1, 16):
-        sAkk[off + my_row, off + (my_row + 16 - d) % 16] = rInv[d] * cutlass.Float32(my_row >= d)
+        sAkk[r_off + my_row, c_off + (my_row + 16 - d) % 16] = rInv[d] * cutlass.Float32(my_row >= d)
 
 
 # ===========================================================================
-# Helper: 16×16 matmul  C = sAkk[A_block] @ sAkk[B_block]
-# A loaded row-major, B loaded col-major.  Returns 8 C regs (two n-tiles).
+# 16×16 matmul: load A & B from sAkk, MMA, return C registers
 # ===========================================================================
 @dsl_user_op
-def _matmul_AB(
-    sAkk: cute.Tensor,
-    a_rb, a_cb, b_rb, b_cb,
-    lane_id,
-    *, loc=None, ip=None,
-):
+def _matmul_AB(sAkk: cute.Tensor, br_A, bc_A, br_B, bc_B, lane_id,
+               *, loc=None, ip=None):
     gid = lane_id // 4
     tid = lane_id % 4
     _z = cutlass.Float32(0.0)
+    rA = br_A * 16
+    cA = bc_A * 16
+    rB = br_B * 16
+    cB = bc_B * 16
 
-    # A k-tile 0
-    a0k0 = cutlass.Float32(sAkk[a_rb + gid,     a_cb + 2 * tid])
-    a1k0 = cutlass.Float32(sAkk[a_rb + gid + 8, a_cb + 2 * tid])
-    a2k0 = cutlass.Float32(sAkk[a_rb + gid,     a_cb + 2 * tid + 1])
-    a3k0 = cutlass.Float32(sAkk[a_rb + gid + 8, a_cb + 2 * tid + 1])
-    # A k-tile 1
-    a0k1 = cutlass.Float32(sAkk[a_rb + gid,     a_cb + 8 + 2 * tid])
-    a1k1 = cutlass.Float32(sAkk[a_rb + gid + 8, a_cb + 8 + 2 * tid])
-    a2k1 = cutlass.Float32(sAkk[a_rb + gid,     a_cb + 8 + 2 * tid + 1])
-    a3k1 = cutlass.Float32(sAkk[a_rb + gid + 8, a_cb + 8 + 2 * tid + 1])
+    a0k0 = cutlass.Float32(sAkk[rA + gid,     cA + 2 * tid])
+    a1k0 = cutlass.Float32(sAkk[rA + gid + 8, cA + 2 * tid])
+    a2k0 = cutlass.Float32(sAkk[rA + gid,     cA + 2 * tid + 1])
+    a3k0 = cutlass.Float32(sAkk[rA + gid + 8, cA + 2 * tid + 1])
+    a0k1 = cutlass.Float32(sAkk[rA + gid,     cA + 8 + 2 * tid])
+    a1k1 = cutlass.Float32(sAkk[rA + gid + 8, cA + 8 + 2 * tid])
+    a2k1 = cutlass.Float32(sAkk[rA + gid,     cA + 8 + 2 * tid + 1])
+    a3k1 = cutlass.Float32(sAkk[rA + gid + 8, cA + 8 + 2 * tid + 1])
 
-    # B 4 (k,n) sub-tiles
-    b0_00 = cutlass.Float32(sAkk[b_rb + 2 * tid,     b_cb + gid])
-    b1_00 = cutlass.Float32(sAkk[b_rb + 2 * tid + 1, b_cb + gid])
-    b0_01 = cutlass.Float32(sAkk[b_rb + 2 * tid,     b_cb + 8 + gid])
-    b1_01 = cutlass.Float32(sAkk[b_rb + 2 * tid + 1, b_cb + 8 + gid])
-    b0_10 = cutlass.Float32(sAkk[b_rb + 8 + 2 * tid,     b_cb + gid])
-    b1_10 = cutlass.Float32(sAkk[b_rb + 8 + 2 * tid + 1, b_cb + gid])
-    b0_11 = cutlass.Float32(sAkk[b_rb + 8 + 2 * tid,     b_cb + 8 + gid])
-    b1_11 = cutlass.Float32(sAkk[b_rb + 8 + 2 * tid + 1, b_cb + 8 + gid])
+    b0_k0n0 = cutlass.Float32(sAkk[rB + 2 * tid,     cB + gid])
+    b1_k0n0 = cutlass.Float32(sAkk[rB + 2 * tid + 1, cB + gid])
+    b0_k0n1 = cutlass.Float32(sAkk[rB + 2 * tid,     cB + 8 + gid])
+    b1_k0n1 = cutlass.Float32(sAkk[rB + 2 * tid + 1, cB + 8 + gid])
+    b0_k1n0 = cutlass.Float32(sAkk[rB + 8 + 2 * tid,     cB + gid])
+    b1_k1n0 = cutlass.Float32(sAkk[rB + 8 + 2 * tid + 1, cB + gid])
+    b0_k1n1 = cutlass.Float32(sAkk[rB + 8 + 2 * tid,     cB + 8 + gid])
+    b1_k1n1 = cutlass.Float32(sAkk[rB + 8 + 2 * tid + 1, cB + 8 + gid])
 
     cn0_0, cn0_1, cn0_2, cn0_3 = mma_tf32_m16n8k8(
-        a0k0, a1k0, a2k0, a3k0, b0_00, b1_00, _z, _z, _z, _z)
+        a0k0, a1k0, a2k0, a3k0, b0_k0n0, b1_k0n0, _z, _z, _z, _z)
     cn0_0, cn0_1, cn0_2, cn0_3 = mma_tf32_m16n8k8(
-        a0k1, a1k1, a2k1, a3k1, b0_10, b1_10, cn0_0, cn0_1, cn0_2, cn0_3)
+        a0k1, a1k1, a2k1, a3k1, b0_k1n0, b1_k1n0, cn0_0, cn0_1, cn0_2, cn0_3)
     cn1_0, cn1_1, cn1_2, cn1_3 = mma_tf32_m16n8k8(
-        a0k0, a1k0, a2k0, a3k0, b0_01, b1_01, _z, _z, _z, _z)
+        a0k0, a1k0, a2k0, a3k0, b0_k0n1, b1_k0n1, _z, _z, _z, _z)
     cn1_0, cn1_1, cn1_2, cn1_3 = mma_tf32_m16n8k8(
-        a0k1, a1k1, a2k1, a3k1, b0_11, b1_11, cn1_0, cn1_1, cn1_2, cn1_3)
+        a0k1, a1k1, a2k1, a3k1, b0_k1n1, b1_k1n1, cn1_0, cn1_1, cn1_2, cn1_3)
 
     return cn0_0, cn0_1, cn0_2, cn0_3, cn1_0, cn1_1, cn1_2, cn1_3
 
 
 # ===========================================================================
-# Helper: chain MMA — uses existing C regs as A (C→A swap), loads B from sAkk
-# Result = T @ B  where T is passed via (t_n0, t_n1) in C layout.
+# Chain MMA: pre-loaded A (from C→A swap), load B from sAkk  (Stage 2)
 # ===========================================================================
 @dsl_user_op
-def _chain_mma_B(
-    sAkk: cute.Tensor,
-    b_rb, b_cb,
-    lane_id,
-    t0, t1, t2, t3, t4, t5, t6, t7,
-    *, loc=None, ip=None,
-):
+def _chain_mma_B(sAkk: cute.Tensor, br_B, bc_B,
+                 a0k0, a1k0, a2k0, a3k0, a0k1, a1k1, a2k1, a3k1,
+                 lane_id, *, loc=None, ip=None):
     gid = lane_id // 4
     tid = lane_id % 4
     _z = cutlass.Float32(0.0)
+    rB = br_B * 16
+    cB = bc_B * 16
 
-    # C→A swap: a0=c0, a1=c2, a2=c1, a3=c3
-    # t_n0 → A_k0,  t_n1 → A_k1
-    ak0_0, ak0_1, ak0_2, ak0_3 = t0, t2, t1, t3
-    ak1_0, ak1_1, ak1_2, ak1_3 = t4, t6, t5, t7
-
-    b0_00 = cutlass.Float32(sAkk[b_rb + 2 * tid,     b_cb + gid])
-    b1_00 = cutlass.Float32(sAkk[b_rb + 2 * tid + 1, b_cb + gid])
-    b0_01 = cutlass.Float32(sAkk[b_rb + 2 * tid,     b_cb + 8 + gid])
-    b1_01 = cutlass.Float32(sAkk[b_rb + 2 * tid + 1, b_cb + 8 + gid])
-    b0_10 = cutlass.Float32(sAkk[b_rb + 8 + 2 * tid,     b_cb + gid])
-    b1_10 = cutlass.Float32(sAkk[b_rb + 8 + 2 * tid + 1, b_cb + gid])
-    b0_11 = cutlass.Float32(sAkk[b_rb + 8 + 2 * tid,     b_cb + 8 + gid])
-    b1_11 = cutlass.Float32(sAkk[b_rb + 8 + 2 * tid + 1, b_cb + 8 + gid])
+    b0_k0n0 = cutlass.Float32(sAkk[rB + 2 * tid,     cB + gid])
+    b1_k0n0 = cutlass.Float32(sAkk[rB + 2 * tid + 1, cB + gid])
+    b0_k0n1 = cutlass.Float32(sAkk[rB + 2 * tid,     cB + 8 + gid])
+    b1_k0n1 = cutlass.Float32(sAkk[rB + 2 * tid + 1, cB + 8 + gid])
+    b0_k1n0 = cutlass.Float32(sAkk[rB + 8 + 2 * tid,     cB + gid])
+    b1_k1n0 = cutlass.Float32(sAkk[rB + 8 + 2 * tid + 1, cB + gid])
+    b0_k1n1 = cutlass.Float32(sAkk[rB + 8 + 2 * tid,     cB + 8 + gid])
+    b1_k1n1 = cutlass.Float32(sAkk[rB + 8 + 2 * tid + 1, cB + 8 + gid])
 
     cn0_0, cn0_1, cn0_2, cn0_3 = mma_tf32_m16n8k8(
-        ak0_0, ak0_1, ak0_2, ak0_3, b0_00, b1_00, _z, _z, _z, _z)
+        a0k0, a1k0, a2k0, a3k0, b0_k0n0, b1_k0n0, _z, _z, _z, _z)
     cn0_0, cn0_1, cn0_2, cn0_3 = mma_tf32_m16n8k8(
-        ak1_0, ak1_1, ak1_2, ak1_3, b0_10, b1_10, cn0_0, cn0_1, cn0_2, cn0_3)
+        a0k1, a1k1, a2k1, a3k1, b0_k1n0, b1_k1n0, cn0_0, cn0_1, cn0_2, cn0_3)
     cn1_0, cn1_1, cn1_2, cn1_3 = mma_tf32_m16n8k8(
-        ak0_0, ak0_1, ak0_2, ak0_3, b0_01, b1_01, _z, _z, _z, _z)
+        a0k0, a1k0, a2k0, a3k0, b0_k0n1, b1_k0n1, _z, _z, _z, _z)
     cn1_0, cn1_1, cn1_2, cn1_3 = mma_tf32_m16n8k8(
-        ak1_0, ak1_1, ak1_2, ak1_3, b0_11, b1_11, cn1_0, cn1_1, cn1_2, cn1_3)
+        a0k1, a1k1, a2k1, a3k1, b0_k1n1, b1_k1n1, cn1_0, cn1_1, cn1_2, cn1_3)
 
     return cn0_0, cn0_1, cn0_2, cn0_3, cn1_0, cn1_1, cn1_2, cn1_3
 
 
 # ===========================================================================
-# Helper: store negated C fragment to sAkk (16×16 = two 16×8 n-tiles)
+# Chain MMA: load A from sAkk, pre-loaded B (from C→B shuffle)  (Stages 3-4)
 # ===========================================================================
 @dsl_user_op
-def _store_neg_C(
-    sAkk: cute.Tensor, rb, cb,
-    c0, c1, c2, c3, c4, c5, c6, c7,
-    lane_id,
-    *, loc=None, ip=None,
-):
+def _chain_mma_A(sAkk: cute.Tensor, br_A, bc_A,
+                 b0_k0n0, b1_k0n0, b0_k0n1, b1_k0n1,
+                 b0_k1n0, b1_k1n0, b0_k1n1, b1_k1n1,
+                 lane_id, *, loc=None, ip=None):
     gid = lane_id // 4
     tid = lane_id % 4
-    sAkk[rb + gid,     cb + 2 * tid]         = -c0
-    sAkk[rb + gid,     cb + 2 * tid + 1]     = -c1
-    sAkk[rb + gid + 8, cb + 2 * tid]         = -c2
-    sAkk[rb + gid + 8, cb + 2 * tid + 1]     = -c3
-    sAkk[rb + gid,     cb + 8 + 2 * tid]     = -c4
-    sAkk[rb + gid,     cb + 8 + 2 * tid + 1] = -c5
-    sAkk[rb + gid + 8, cb + 8 + 2 * tid]     = -c6
-    sAkk[rb + gid + 8, cb + 8 + 2 * tid + 1] = -c7
+    _z = cutlass.Float32(0.0)
+    rA = br_A * 16
+    cA = bc_A * 16
+
+    a0k0 = cutlass.Float32(sAkk[rA + gid,     cA + 2 * tid])
+    a1k0 = cutlass.Float32(sAkk[rA + gid + 8, cA + 2 * tid])
+    a2k0 = cutlass.Float32(sAkk[rA + gid,     cA + 2 * tid + 1])
+    a3k0 = cutlass.Float32(sAkk[rA + gid + 8, cA + 2 * tid + 1])
+    a0k1 = cutlass.Float32(sAkk[rA + gid,     cA + 8 + 2 * tid])
+    a1k1 = cutlass.Float32(sAkk[rA + gid + 8, cA + 8 + 2 * tid])
+    a2k1 = cutlass.Float32(sAkk[rA + gid,     cA + 8 + 2 * tid + 1])
+    a3k1 = cutlass.Float32(sAkk[rA + gid + 8, cA + 8 + 2 * tid + 1])
+
+    cn0_0, cn0_1, cn0_2, cn0_3 = mma_tf32_m16n8k8(
+        a0k0, a1k0, a2k0, a3k0, b0_k0n0, b1_k0n0, _z, _z, _z, _z)
+    cn0_0, cn0_1, cn0_2, cn0_3 = mma_tf32_m16n8k8(
+        a0k1, a1k1, a2k1, a3k1, b0_k1n0, b1_k1n0, cn0_0, cn0_1, cn0_2, cn0_3)
+    cn1_0, cn1_1, cn1_2, cn1_3 = mma_tf32_m16n8k8(
+        a0k0, a1k0, a2k0, a3k0, b0_k0n1, b1_k0n1, _z, _z, _z, _z)
+    cn1_0, cn1_1, cn1_2, cn1_3 = mma_tf32_m16n8k8(
+        a0k1, a1k1, a2k1, a3k1, b0_k1n1, b1_k1n1, cn1_0, cn1_1, cn1_2, cn1_3)
+
+    return cn0_0, cn0_1, cn0_2, cn0_3, cn1_0, cn1_1, cn1_2, cn1_3
 
 
 # ===========================================================================
-# sTemp helpers: store C, load C (inter-warp communication only)
+# Store negated C result (16×16) to sAkk
 # ===========================================================================
 @dsl_user_op
-def _store_C_temp(
-    sT: cute.Tensor, buf,
-    c0, c1, c2, c3, c4, c5, c6, c7,
-    lane_id,
-    *, loc=None, ip=None,
-):
+def _store_neg_C(sAkk: cute.Tensor, br, bc,
+                 c0, c1, c2, c3, c4, c5, c6, c7,
+                 lane_id, *, loc=None, ip=None):
     gid = lane_id // 4
     tid = lane_id % 4
-    sT[gid,     2 * tid,         buf] = c0
-    sT[gid,     2 * tid + 1,     buf] = c1
-    sT[gid + 8, 2 * tid,         buf] = c2
-    sT[gid + 8, 2 * tid + 1,     buf] = c3
-    sT[gid,     8 + 2 * tid,     buf] = c4
-    sT[gid,     8 + 2 * tid + 1, buf] = c5
-    sT[gid + 8, 8 + 2 * tid,     buf] = c6
-    sT[gid + 8, 8 + 2 * tid + 1, buf] = c7
-
-
-@dsl_user_op
-def _load_C_temp(sT: cute.Tensor, buf, lane_id, *, loc=None, ip=None):
-    gid = lane_id // 4
-    tid = lane_id % 4
-    c0 = cutlass.Float32(sT[gid,     2 * tid,         buf])
-    c1 = cutlass.Float32(sT[gid,     2 * tid + 1,     buf])
-    c2 = cutlass.Float32(sT[gid + 8, 2 * tid,         buf])
-    c3 = cutlass.Float32(sT[gid + 8, 2 * tid + 1,     buf])
-    c4 = cutlass.Float32(sT[gid,     8 + 2 * tid,     buf])
-    c5 = cutlass.Float32(sT[gid,     8 + 2 * tid + 1, buf])
-    c6 = cutlass.Float32(sT[gid + 8, 8 + 2 * tid,     buf])
-    c7 = cutlass.Float32(sT[gid + 8, 8 + 2 * tid + 1, buf])
-    return c0, c1, c2, c3, c4, c5, c6, c7
+    r = br * 16
+    c = bc * 16
+    sAkk[r + gid,     c + 2 * tid]         = -c0
+    sAkk[r + gid,     c + 2 * tid + 1]     = -c1
+    sAkk[r + gid + 8, c + 2 * tid]         = -c2
+    sAkk[r + gid + 8, c + 2 * tid + 1]     = -c3
+    sAkk[r + gid,     c + 8 + 2 * tid]     = -c4
+    sAkk[r + gid,     c + 8 + 2 * tid + 1] = -c5
+    sAkk[r + gid + 8, c + 8 + 2 * tid]     = -c6
+    sAkk[r + gid + 8, c + 8 + 2 * tid + 1] = -c7
 
 
 # ===========================================================================
 # Shuffle C-accumulator layout → B-operand layout (warp-level, no SMEM)
-#
-# C layout (16×16): thread (gid,tid) holds c0=M[gid,2t], c1=M[gid,2t+1],
-#   c2=M[gid+8,2t], c3=M[gid+8,2t+1], c4..c7 for cols 8-15.
-# B layout (k16×n16): thread needs b[2t,gid], b[2t+1,gid], etc.
-#
-# Source lanes:  src_a = 8*tid + gid//2  (rows 0-7 of B)
-#                src_b = src_a + 4        (rows 1,3,5,7 of B)
-# Select:        gid even → c_even reg,  gid odd → c_odd reg
 # ===========================================================================
 @dsl_user_op
 def _shuffle_C_to_B(
@@ -322,42 +306,40 @@ def _shuffle_C_to_B(
 
 
 # ===========================================================================
-# Helper: load A from sAkk + B from shuffled C regs, MMA, return C
-# Replaces _mma_A_smem_B_temp — no SMEM roundtrip for B operand.
+# sTemp helpers (non-swizzled, direct indexing OK)
 # ===========================================================================
 @dsl_user_op
-def _mma_A_smem_B_shfl(
-    sAkk: cute.Tensor, a_rb, a_cb,
+def _store_C_temp(
+    sT: cute.Tensor, buf,
     c0, c1, c2, c3, c4, c5, c6, c7,
     lane_id,
     *, loc=None, ip=None,
 ):
     gid = lane_id // 4
     tid = lane_id % 4
-    _z = cutlass.Float32(0.0)
+    sT[gid,     2 * tid,         buf] = c0
+    sT[gid,     2 * tid + 1,     buf] = c1
+    sT[gid + 8, 2 * tid,         buf] = c2
+    sT[gid + 8, 2 * tid + 1,     buf] = c3
+    sT[gid,     8 + 2 * tid,     buf] = c4
+    sT[gid,     8 + 2 * tid + 1, buf] = c5
+    sT[gid + 8, 8 + 2 * tid,     buf] = c6
+    sT[gid + 8, 8 + 2 * tid + 1, buf] = c7
 
-    a0k0 = cutlass.Float32(sAkk[a_rb + gid,     a_cb + 2 * tid])
-    a1k0 = cutlass.Float32(sAkk[a_rb + gid + 8, a_cb + 2 * tid])
-    a2k0 = cutlass.Float32(sAkk[a_rb + gid,     a_cb + 2 * tid + 1])
-    a3k0 = cutlass.Float32(sAkk[a_rb + gid + 8, a_cb + 2 * tid + 1])
-    a0k1 = cutlass.Float32(sAkk[a_rb + gid,     a_cb + 8 + 2 * tid])
-    a1k1 = cutlass.Float32(sAkk[a_rb + gid + 8, a_cb + 8 + 2 * tid])
-    a2k1 = cutlass.Float32(sAkk[a_rb + gid,     a_cb + 8 + 2 * tid + 1])
-    a3k1 = cutlass.Float32(sAkk[a_rb + gid + 8, a_cb + 8 + 2 * tid + 1])
 
-    b0_00, b1_00, b0_10, b1_10, b0_01, b1_01, b0_11, b1_11 = \
-        _shuffle_C_to_B(c0, c1, c2, c3, c4, c5, c6, c7, lane_id)
-
-    cn0_0, cn0_1, cn0_2, cn0_3 = mma_tf32_m16n8k8(
-        a0k0, a1k0, a2k0, a3k0, b0_00, b1_00, _z, _z, _z, _z)
-    cn0_0, cn0_1, cn0_2, cn0_3 = mma_tf32_m16n8k8(
-        a0k1, a1k1, a2k1, a3k1, b0_10, b1_10, cn0_0, cn0_1, cn0_2, cn0_3)
-    cn1_0, cn1_1, cn1_2, cn1_3 = mma_tf32_m16n8k8(
-        a0k0, a1k0, a2k0, a3k0, b0_01, b1_01, _z, _z, _z, _z)
-    cn1_0, cn1_1, cn1_2, cn1_3 = mma_tf32_m16n8k8(
-        a0k1, a1k1, a2k1, a3k1, b0_11, b1_11, cn1_0, cn1_1, cn1_2, cn1_3)
-
-    return cn0_0, cn0_1, cn0_2, cn0_3, cn1_0, cn1_1, cn1_2, cn1_3
+@dsl_user_op
+def _load_C_temp(sT: cute.Tensor, buf, lane_id, *, loc=None, ip=None):
+    gid = lane_id // 4
+    tid = lane_id % 4
+    c0 = cutlass.Float32(sT[gid,     2 * tid,         buf])
+    c1 = cutlass.Float32(sT[gid,     2 * tid + 1,     buf])
+    c2 = cutlass.Float32(sT[gid + 8, 2 * tid,         buf])
+    c3 = cutlass.Float32(sT[gid + 8, 2 * tid + 1,     buf])
+    c4 = cutlass.Float32(sT[gid,     8 + 2 * tid,     buf])
+    c5 = cutlass.Float32(sT[gid,     8 + 2 * tid + 1, buf])
+    c6 = cutlass.Float32(sT[gid + 8, 8 + 2 * tid,     buf])
+    c7 = cutlass.Float32(sT[gid + 8, 8 + 2 * tid + 1, buf])
+    return c0, c1, c2, c3, c4, c5, c6, c7
 
 
 # ===========================================================================
@@ -365,10 +347,10 @@ def _mma_A_smem_B_shfl(
 # ===========================================================================
 @cute.kernel
 def akk_inv_kernel(
-    tma_load_atom: cute.CopyAtom,
-    tma_load_tensor: cute.Tensor,
+    g2s_copy: cute.TiledCopy,
+    gA_tensor: cute.Tensor,
     mOut: cute.Tensor,
-    akk_smem_layout,
+    akk_smem_layout: cute.Layout,
     temp_layout: cute.Layout,
     NT: int,
     H: int,
@@ -381,177 +363,149 @@ def akk_inv_kernel(
 
     # ===== SMEM allocation =====
     smem = cutlass.utils.SmemAllocator()
-    sAkk = smem.allocate_tensor(
-        cutlass.Float32, akk_smem_layout.outer, 128,
-        swizzle=akk_smem_layout.inner)
+    sAkk = smem.allocate_tensor(cutlass.Float32, akk_smem_layout, 128)
     sTemp = smem.allocate_tensor(cutlass.Float32, temp_layout, 128)
-    mbar_ptr = smem.allocate_array(cutlass.Int64, 1)
 
-    tile_bytes = BS * BS * 4
+    # ===== Stage 0: cp.async load fp32 64×64 → sAkk =====
+    gA_batch = gA_tensor[(None, None, h_idx, nt_idx, b_idx)]
 
-    if tidx == 0:
-        cute.arch.mbarrier_init(mbar_ptr, 1)
-    cute.arch.mbarrier_init_fence()
+    thr_g2s = g2s_copy.get_slice(tidx)
+    thr_gSrc = thr_g2s.partition_S(gA_batch)
+    thr_sDst = thr_g2s.partition_D(sAkk)
+    cute.copy(g2s_copy, thr_gSrc, thr_sDst)
+    cute.arch.cp_async_commit_group()
+    cute.arch.cp_async_wait_group(0)
     cute.arch.barrier()
 
-    # ===== Stage 0: TMA Load fp32 64×64 → sAkk =====
-    # Global view is (BS, BS, H, NT, B); select (h, nt, b), then single tile
-    gA_batch = tma_load_tensor[(None, None, h_idx, nt_idx, b_idx)]
-    gA_tile = cute.local_tile(gA_batch, (BS, BS), (0, 0))
-
+    # ===== Stage 1: Diagonal block inversion (in-place on sAkk) =====
     if warp_idx == 0:
-        if tidx == 0:
-            cute.arch.mbarrier_expect_tx(mbar_ptr, tile_bytes)
-        ts_ld, tg_ld = cpasync.tma_partition(
-            tma_load_atom, 0, cute.make_layout(1),
-            cute.group_modes(sAkk, 0, 2),
-            cute.group_modes(gA_tile, 0, 2))
-        cute.copy(tma_load_atom, tg_ld, ts_ld, tma_bar_ptr=mbar_ptr)
-        if tidx == 0:
-            cute.arch.mbarrier_arrive(mbar_ptr)
-
-    cute.arch.mbarrier_wait(mbar_ptr, 0)
-
-    # ===== Stage 1: Diagonal block inversion (warps 0-1, half-warps) =====
-    # warp 0 lanes 0-15 → block(0,0)=0, lanes 16-31 → block(1,1)=16
-    # warp 1 lanes 0-15 → block(2,2)=32, lanes 16-31 → block(3,3)=48
-    if warp_idx == 0:
-        diag = (lane_id // 16) * SB
-        _invert_diag(sAkk, diag, lane_id)
+        _invert_diag(sAkk, lane_id // 16, lane_id)
     if warp_idx == 1:
-        diag = 32 + (lane_id // 16) * SB
-        _invert_diag(sAkk, diag, lane_id)
+        _invert_diag(sAkk, 2 + lane_id // 16, lane_id)
 
     cute.arch.barrier()
 
-    # ===== Stage 2: First batch — independent chain MMAs =====
+    # ===== Stage 2: First batch — Ai10, Ai21, Ai32 =====
     # Warp 0: Ai10 = -(Ai11 @ Akk10) @ Ai00
-    #   A=Ai11(16,16), B=Akk10(0,16), chain B=Ai00(0,0) → out Ai10(16,0)
     if warp_idx == 0:
-        t0, t1, t2, t3, t4, t5, t6, t7 = _matmul_AB(
-            sAkk, 16, 16, 0, 16, lane_id)
-        r0, r1, r2, r3, r4, r5, r6, r7 = _chain_mma_B(
-            sAkk, 0, 0, lane_id, t0, t1, t2, t3, t4, t5, t6, t7)
-        _store_neg_C(sAkk, 16, 0, r0, r1, r2, r3, r4, r5, r6, r7, lane_id)
+        t0,t1,t2,t3,t4,t5,t6,t7 = _matmul_AB(sAkk, 1, 1, 0, 1, lane_id)
+        a0k0,a1k0,a2k0,a3k0 = t0,t2,t1,t3
+        a0k1,a1k1,a2k1,a3k1 = t4,t6,t5,t7
+        r0,r1,r2,r3,r4,r5,r6,r7 = _chain_mma_B(
+            sAkk, 0, 0,
+            a0k0,a1k0,a2k0,a3k0, a0k1,a1k1,a2k1,a3k1, lane_id)
+        _store_neg_C(sAkk, 1, 0, r0,r1,r2,r3,r4,r5,r6,r7, lane_id)
 
     # Warp 1: Ai21 = -(Ai22 @ Akk21) @ Ai11
-    #   A=Ai22(32,32), B=Akk21(16,32), chain B=Ai11(16,16) → out Ai21(32,16)
     if warp_idx == 1:
-        t0, t1, t2, t3, t4, t5, t6, t7 = _matmul_AB(
-            sAkk, 32, 32, 16, 32, lane_id)
-        r0, r1, r2, r3, r4, r5, r6, r7 = _chain_mma_B(
-            sAkk, 16, 16, lane_id, t0, t1, t2, t3, t4, t5, t6, t7)
-        _store_neg_C(sAkk, 32, 16, r0, r1, r2, r3, r4, r5, r6, r7, lane_id)
+        t0,t1,t2,t3,t4,t5,t6,t7 = _matmul_AB(sAkk, 2, 2, 1, 2, lane_id)
+        a0k0,a1k0,a2k0,a3k0 = t0,t2,t1,t3
+        a0k1,a1k1,a2k1,a3k1 = t4,t6,t5,t7
+        r0,r1,r2,r3,r4,r5,r6,r7 = _chain_mma_B(
+            sAkk, 1, 1,
+            a0k0,a1k0,a2k0,a3k0, a0k1,a1k1,a2k1,a3k1, lane_id)
+        _store_neg_C(sAkk, 2, 1, r0,r1,r2,r3,r4,r5,r6,r7, lane_id)
 
     # Warp 2: Ai32 = -(Ai33 @ Akk32) @ Ai22
-    #   A=Ai33(48,48), B=Akk32(32,48), chain B=Ai22(32,32) → out Ai32(48,32)
     if warp_idx == 2:
-        t0, t1, t2, t3, t4, t5, t6, t7 = _matmul_AB(
-            sAkk, 48, 48, 32, 48, lane_id)
-        r0, r1, r2, r3, r4, r5, r6, r7 = _chain_mma_B(
-            sAkk, 32, 32, lane_id, t0, t1, t2, t3, t4, t5, t6, t7)
-        _store_neg_C(sAkk, 48, 32, r0, r1, r2, r3, r4, r5, r6, r7, lane_id)
+        t0,t1,t2,t3,t4,t5,t6,t7 = _matmul_AB(sAkk, 3, 3, 2, 3, lane_id)
+        a0k0,a1k0,a2k0,a3k0 = t0,t2,t1,t3
+        a0k1,a1k1,a2k1,a3k1 = t4,t6,t5,t7
+        r0,r1,r2,r3,r4,r5,r6,r7 = _chain_mma_B(
+            sAkk, 2, 2,
+            a0k0,a1k0,a2k0,a3k0, a0k1,a1k1,a2k1,a3k1, lane_id)
+        _store_neg_C(sAkk, 3, 2, r0,r1,r2,r3,r4,r5,r6,r7, lane_id)
 
     cute.arch.barrier()
 
-    # ===== Stage 3: Second batch — warp pairs via sTemp =====
+    # ===== Stage 3: Second batch — Ai20, Ai31 (warp pairs via sTemp) =====
     _z = cutlass.Float32(0.0)
-    t0 = _z; t1 = _z; t2 = _z; t3 = _z
-    t4 = _z; t5 = _z; t6 = _z; t7 = _z
+    t0=_z; t1=_z; t2=_z; t3=_z; t4=_z; t5=_z; t6=_z; t7=_z
 
     # --- Ai20 = -Ai22 @ (Akk20 @ Ai00 + Akk21 @ Ai10) ---
-    # Warp 0: T1 = Akk20(0,32) @ Ai00(0,0)
     if warp_idx == 0:
-        t0, t1, t2, t3, t4, t5, t6, t7 = _matmul_AB(
-            sAkk, 0, 32, 0, 0, lane_id)
+        t0,t1,t2,t3,t4,t5,t6,t7 = _matmul_AB(sAkk, 0, 2, 0, 0, lane_id)
 
-    # Warp 2: T2 = Akk21(16,32) @ Ai10(16,0) → sTemp[0]
     if warp_idx == 2:
-        s0, s1, s2, s3, s4, s5, s6, s7 = _matmul_AB(
-            sAkk, 16, 32, 16, 0, lane_id)
-        _store_C_temp(sTemp, 0, s0, s1, s2, s3, s4, s5, s6, s7, lane_id)
+        s0,s1,s2,s3,s4,s5,s6,s7 = _matmul_AB(sAkk, 1, 2, 1, 0, lane_id)
+        _store_C_temp(sTemp, 0, s0,s1,s2,s3,s4,s5,s6,s7, lane_id)
 
     # --- Ai31 = -Ai33 @ (Akk31 @ Ai11 + Akk32 @ Ai21) ---
-    # Warp 1: T1' = Akk31(16,48) @ Ai11(16,16)
     if warp_idx == 1:
-        t0, t1, t2, t3, t4, t5, t6, t7 = _matmul_AB(
-            sAkk, 16, 48, 16, 16, lane_id)
+        t0,t1,t2,t3,t4,t5,t6,t7 = _matmul_AB(sAkk, 1, 3, 1, 1, lane_id)
 
-    # Warp 3: T2' = Akk32(32,48) @ Ai21(32,16) → sTemp[1]
     if warp_idx == 3:
-        s0, s1, s2, s3, s4, s5, s6, s7 = _matmul_AB(
-            sAkk, 32, 48, 32, 16, lane_id)
-        _store_C_temp(sTemp, 1, s0, s1, s2, s3, s4, s5, s6, s7, lane_id)
+        s0,s1,s2,s3,s4,s5,s6,s7 = _matmul_AB(sAkk, 2, 3, 2, 1, lane_id)
+        _store_C_temp(sTemp, 1, s0,s1,s2,s3,s4,s5,s6,s7, lane_id)
 
     cute.arch.barrier()
 
-    # Warp 0: accumulate T3 = T1 + T2, final multiply Ai22 @ T3
+    # Warp 0: accumulate T1+T2, shuffle→B, multiply by Ai22
     if warp_idx == 0:
-        e0, e1, e2, e3, e4, e5, e6, e7 = _load_C_temp(sTemp, 0, lane_id)
-        t0 = t0 + e0; t1 = t1 + e1; t2 = t2 + e2; t3 = t3 + e3
-        t4 = t4 + e4; t5 = t5 + e5; t6 = t6 + e6; t7 = t7 + e7
-        r0, r1, r2, r3, r4, r5, r6, r7 = _mma_A_smem_B_shfl(
-            sAkk, 32, 32, t0, t1, t2, t3, t4, t5, t6, t7, lane_id)
-        _store_neg_C(sAkk, 32, 0, r0, r1, r2, r3, r4, r5, r6, r7, lane_id)
+        e0,e1,e2,e3,e4,e5,e6,e7 = _load_C_temp(sTemp, 0, lane_id)
+        t0=t0+e0; t1=t1+e1; t2=t2+e2; t3=t3+e3
+        t4=t4+e4; t5=t5+e5; t6=t6+e6; t7=t7+e7
+        sb = _shuffle_C_to_B(t0,t1,t2,t3,t4,t5,t6,t7, lane_id)
+        r0,r1,r2,r3,r4,r5,r6,r7 = _chain_mma_A(
+            sAkk, 2, 2,
+            sb[0],sb[1], sb[4],sb[5], sb[2],sb[3], sb[6],sb[7], lane_id)
+        _store_neg_C(sAkk, 2, 0, r0,r1,r2,r3,r4,r5,r6,r7, lane_id)
 
-    # Warp 1: accumulate T3' = T1' + T2', final multiply Ai33 @ T3'
+    # Warp 1: accumulate T1'+T2', shuffle→B, multiply by Ai33
     if warp_idx == 1:
-        e0, e1, e2, e3, e4, e5, e6, e7 = _load_C_temp(sTemp, 1, lane_id)
-        t0 = t0 + e0; t1 = t1 + e1; t2 = t2 + e2; t3 = t3 + e3
-        t4 = t4 + e4; t5 = t5 + e5; t6 = t6 + e6; t7 = t7 + e7
-        r0, r1, r2, r3, r4, r5, r6, r7 = _mma_A_smem_B_shfl(
-            sAkk, 48, 48, t0, t1, t2, t3, t4, t5, t6, t7, lane_id)
-        _store_neg_C(sAkk, 48, 16, r0, r1, r2, r3, r4, r5, r6, r7, lane_id)
+        e0,e1,e2,e3,e4,e5,e6,e7 = _load_C_temp(sTemp, 1, lane_id)
+        t0=t0+e0; t1=t1+e1; t2=t2+e2; t3=t3+e3
+        t4=t4+e4; t5=t5+e5; t6=t6+e6; t7=t7+e7
+        sb = _shuffle_C_to_B(t0,t1,t2,t3,t4,t5,t6,t7, lane_id)
+        r0,r1,r2,r3,r4,r5,r6,r7 = _chain_mma_A(
+            sAkk, 3, 3,
+            sb[0],sb[1], sb[4],sb[5], sb[2],sb[3], sb[6],sb[7], lane_id)
+        _store_neg_C(sAkk, 3, 1, r0,r1,r2,r3,r4,r5,r6,r7, lane_id)
 
     cute.arch.barrier()
 
-    # ===== Stage 4: Third batch — Ai30 via 3 warps =====
-    # Ai30 = -Ai33 @ (Akk30 @ Ai00 + Akk31 @ Ai10 + Akk32 @ Ai20)
-    t0 = _z; t1 = _z; t2 = _z; t3 = _z
-    t4 = _z; t5 = _z; t6 = _z; t7 = _z
+    # ===== Stage 4: Third batch — Ai30 =====
+    t0=_z; t1=_z; t2=_z; t3=_z; t4=_z; t5=_z; t6=_z; t7=_z
 
-    # Warp 0: T1 = Akk30(0,48) @ Ai00(0,0)
     if warp_idx == 0:
-        t0, t1, t2, t3, t4, t5, t6, t7 = _matmul_AB(
-            sAkk, 0, 48, 0, 0, lane_id)
+        t0,t1,t2,t3,t4,t5,t6,t7 = _matmul_AB(sAkk, 0, 3, 0, 0, lane_id)
 
-    # Warp 1: T2 = Akk31(16,48) @ Ai10(16,0) → sTemp[0]
     if warp_idx == 1:
-        s0, s1, s2, s3, s4, s5, s6, s7 = _matmul_AB(
-            sAkk, 16, 48, 16, 0, lane_id)
-        _store_C_temp(sTemp, 0, s0, s1, s2, s3, s4, s5, s6, s7, lane_id)
+        s0,s1,s2,s3,s4,s5,s6,s7 = _matmul_AB(sAkk, 1, 3, 1, 0, lane_id)
+        _store_C_temp(sTemp, 0, s0,s1,s2,s3,s4,s5,s6,s7, lane_id)
 
-    # Warp 2: T3 = Akk32(32,48) @ Ai20(32,0) → sTemp[1]
     if warp_idx == 2:
-        s0, s1, s2, s3, s4, s5, s6, s7 = _matmul_AB(
-            sAkk, 32, 48, 32, 0, lane_id)
-        _store_C_temp(sTemp, 1, s0, s1, s2, s3, s4, s5, s6, s7, lane_id)
+        s0,s1,s2,s3,s4,s5,s6,s7 = _matmul_AB(sAkk, 2, 3, 2, 0, lane_id)
+        _store_C_temp(sTemp, 1, s0,s1,s2,s3,s4,s5,s6,s7, lane_id)
 
     cute.arch.barrier()
 
-    # Warp 0: accumulate and final multiply
+    # Warp 0: accumulate all three, shuffle→B, multiply by Ai33
     if warp_idx == 0:
-        e0, e1, e2, e3, e4, e5, e6, e7 = _load_C_temp(sTemp, 0, lane_id)
-        t0 = t0 + e0; t1 = t1 + e1; t2 = t2 + e2; t3 = t3 + e3
-        t4 = t4 + e4; t5 = t5 + e5; t6 = t6 + e6; t7 = t7 + e7
-        e0, e1, e2, e3, e4, e5, e6, e7 = _load_C_temp(sTemp, 1, lane_id)
-        t0 = t0 + e0; t1 = t1 + e1; t2 = t2 + e2; t3 = t3 + e3
-        t4 = t4 + e4; t5 = t5 + e5; t6 = t6 + e6; t7 = t7 + e7
-        r0, r1, r2, r3, r4, r5, r6, r7 = _mma_A_smem_B_shfl(
-            sAkk, 48, 48, t0, t1, t2, t3, t4, t5, t6, t7, lane_id)
-        _store_neg_C(sAkk, 48, 0, r0, r1, r2, r3, r4, r5, r6, r7, lane_id)
+        e0,e1,e2,e3,e4,e5,e6,e7 = _load_C_temp(sTemp, 0, lane_id)
+        t0=t0+e0; t1=t1+e1; t2=t2+e2; t3=t3+e3
+        t4=t4+e4; t5=t5+e5; t6=t6+e6; t7=t7+e7
+        e0,e1,e2,e3,e4,e5,e6,e7 = _load_C_temp(sTemp, 1, lane_id)
+        t0=t0+e0; t1=t1+e1; t2=t2+e2; t3=t3+e3
+        t4=t4+e4; t5=t5+e5; t6=t6+e6; t7=t7+e7
+        sb = _shuffle_C_to_B(t0,t1,t2,t3,t4,t5,t6,t7, lane_id)
+        r0,r1,r2,r3,r4,r5,r6,r7 = _chain_mma_A(
+            sAkk, 3, 3,
+            sb[0],sb[1], sb[4],sb[5], sb[2],sb[3], sb[6],sb[7], lane_id)
+        _store_neg_C(sAkk, 3, 0, r0,r1,r2,r3,r4,r5,r6,r7, lane_id)
 
     cute.arch.barrier()
 
     # ===== Stage 5: Store sAkk fp32 → bf16 to global [B, T, H, BT] =====
     row_start = warp_idx * SB
+
     for ri in cutlass.range_constexpr(SB):
         row = row_start + ri
-        t_row = nt_idx * BS + row
         c0 = lane_id * 2
         c1 = lane_id * 2 + 1
         v0 = cutlass.Float32(sAkk[row, c0]) * cutlass.Float32(row >= c0)
         v1 = cutlass.Float32(sAkk[row, c1]) * cutlass.Float32(row >= c1)
+        t_row = nt_idx * BS + row
         mOut[b_idx, t_row, h_idx, c0] = v0.to(cutlass.BFloat16)
         mOut[b_idx, t_row, h_idx, c1] = v1.to(cutlass.BFloat16)
 
@@ -567,33 +521,40 @@ def akk_inv_host(
     NT: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
 ):
-    T = NT * BS
+    T_val = NT * BS
     view_layout = cute.make_layout(
         (BS, BS, H, NT, B),
-        stride=(H * BS, 1, BS, BS * H * BS, T * H * BS))
-    akk_view = cute.make_tensor(A_in.iterator, view_layout)
+        stride=(H * BS, 1, BS, BS * H * BS, T_val * H * BS))
+    gA_view = cute.make_tensor(A_in.iterator, view_layout)
 
-    sw = cute.make_swizzle(2, 5, 2)
-    outer = cute.make_layout((8, 32), stride=(32, 1))
-    smem_atom = cute.make_composed_layout(sw, 0, outer)
-    akk_smem_2d = cute.tile_to_shape(smem_atom, (BS, BS), order=(0, 1))
+    # sAkk: non-swizzled padded layout (stride 72)
+    akk_smem_2d = cute.make_layout((BS, BS), stride=(AKK_STRIDE, 1))
 
-    tma_op = cpasync.CopyBulkTensorTileG2SOp(cpasync.CtaGroup.ONE)
-    tma_load_atom, tma_load_tensor = cpasync.make_tiled_tma_atom(
-        tma_op, akk_view, akk_smem_2d,
-        cute.product_each(akk_smem_2d.shape), num_multicast=1)
+    # cp.async G→S copy: 128-bit (4×fp32) vectorised
+    copy_atom = cute.make_copy_atom(
+        cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+        cutlass.Float32,
+        num_bits_per_copy=128,
+    )
+    g2s_copy = cute.make_tiled_copy_tv(
+        copy_atom,
+        thr_layout=cute.make_layout((16, 8), stride=(8, 1)),
+        val_layout=cute.make_layout((1, 4)),
+    )
 
+    # sTemp layout (non-swizzled)
     temp_layout = cute.make_layout(
         (SB, TEMP_COLS, NUM_TEMPS),
         stride=(TEMP_COLS, 1, SB * TEMP_COLS))
 
-    smem_bytes = (BS * BS * 4
+    smem_bytes = (BS * AKK_STRIDE * 4
                   + SB * TEMP_COLS * NUM_TEMPS * 4
-                  + 8 + 256)
+                  + 256)
 
     akk_inv_kernel(
-        tma_load_atom, tma_load_tensor, A_out,
-        akk_smem_2d, temp_layout, NT, H,
+        g2s_copy, gA_view, A_out,
+        akk_smem_2d, temp_layout,
+        NT, H,
     ).launch(
         grid=(H, NT, B),
         block=(THREADS, 1, 1),
@@ -635,10 +596,11 @@ def test_akk_inv():
     BENCH = 100
 
     print("=" * 60)
-    print("Akk 64×64 Inverse — TF32 MMA, FP32 SMEM")
+    print("Akk 64x64 Inverse — TF32 MMA, FP32 SMEM (padded+cp.async)")
     print("=" * 60)
     print(f"  B={B_TEST}, NT={NT_TEST}, H={H_TEST}, T={T_TEST}")
-    print(f"  inv_batch={inv_batch},  Matrix: {BS}×{BS},  Threads: {THREADS}")
+    print(f"  inv_batch={inv_batch},  Matrix: {BS}x{BS},  Threads: {THREADS}")
+    print(f"  AKK_STRIDE={AKK_STRIDE} (pad={AKK_PAD})")
 
     torch.manual_seed(42)
 
@@ -646,9 +608,8 @@ def test_akk_inv():
     L = L.tril(-1)
     M = torch.eye(BS, device="cuda", dtype=torch.float32).unsqueeze(0) + L
 
-    M_bt = prepare_input(M)  # [inv_batch, 64, 64] block-transposed
+    M_bt = prepare_input(M)
 
-    # Reshape [inv_batch, BT, BT] → [B, T, H, BT] matching fused kernel output
     M_input = (M_bt
                .reshape(B_TEST, NT_TEST, H_TEST, BS, BS)
                .permute(0, 1, 3, 2, 4)
@@ -679,7 +640,6 @@ def test_akk_inv():
     M_inv_ref = torch.linalg.inv(M)
     mask = torch.tril(torch.ones(BS, BS, device="cuda", dtype=torch.bool))
 
-    # Reshape output [B, T, H, BT] → [inv_batch, BT, BT] for comparison
     out_3d = (M_out
               .reshape(B_TEST, NT_TEST, BS, H_TEST, BS)
               .permute(0, 1, 3, 2, 4)
