@@ -45,8 +45,8 @@ Outputs (g_cumsum stays in SMEM, not written to GMEM):
 """
 
 import sys
-sys.path.insert(0, '/home/scratch.peiyuanz_gpu/mhl/Personal_workspace/scripts/kda_optimized')
-sys.path.insert(0, '/home/scratch.peiyuanz_gpu/mhl/Personal_workspace/flash-linear-attention')
+sys.path.insert(0, '/home/scratch.hmi_wwfo/scripts/kda_optimized')
+sys.path.insert(0, '/home/scratch.hmi_wwfo/flash-linear-attention')
 
 import cutlass
 import cutlass.cute as cute

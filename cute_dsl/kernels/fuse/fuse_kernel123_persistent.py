@@ -12,13 +12,15 @@ Block: 1024 threads (32 warps), warp-specialized with setmaxnreg (all groups 4-a
   Warps 16-27: K2 MMA compute (10 active + 2 idle for WG alignment) – 3 WGs, 72 regs
   Warps 28-31: Store/Inversion warps – 1 WG, 24 regs
 
-Pipeline (prefetch overlap, per work unit of 4 chunks):
-  Warps 0-15:  prefetch chunk 0→stage 0 (warp 0), then loop:
-                  TMA next chunk (warp 0), wait cur chunk, K1 compute, arrive(k1_done)
-  Warps 16-27: wait(k1_done) + wait(store_done) + wait(tma), MMA, arrive(mma_done + stage_reuse)
-  Warps 28-31: wait(mma_done), store sAqk/sAkk→GMEM, arrive(store_done)
-  Mbarrier phases self-reset after 4 iterations (2 stages × 2 phases), enabling
-  seamless transition to the next work unit without re-initialization.
+Pipeline (single for_generate, warp groups separated by if-blocks):
+  per work unit:
+    Warps 0-15:  prefetch chunk 0→stage 0 (warp 0), then loop:
+                    TMA next chunk (warp 0), wait cur chunk, K1 compute, arrive(k1_done)
+    Warps 16-27: wait(k1_done)+wait(store_done), MMA, arrive(mma_done+stage_reuse)
+    Warps 28-31: wait(mma_done), store sAqk/sAkk→GMEM, arrive(store_done)
+  All warp-group invariants are computed inside each group's if-block (not hoisted)
+  to eliminate cross-group register pressure — same budget as the _all version.
+  Mbarrier phases self-reset after 4 iterations (2 stages × 2 phases).
 
 Mbarriers:
   tma_mbars[2]:          count=1, warp 0 lane 0 → K1+MMA wait for TMA data
@@ -49,8 +51,8 @@ Outputs (g_cumsum stays in SMEM, not written to GMEM):
 """
 
 import sys
-sys.path.insert(0, '/home/scratch.peiyuanz_gpu/mhl/Personal_workspace/scripts/kda_optimized')
-sys.path.insert(0, '/home/scratch.peiyuanz_gpu/mhl/Personal_workspace/flash-linear-attention')
+sys.path.insert(0, '/home/scratch.hmi_wwfo/scripts/kda_optimized')
+sys.path.insert(0, '/home/scratch.hmi_wwfo/flash-linear-attention')
 
 import cutlass
 import cutlass.cute as cute
@@ -185,6 +187,32 @@ def mma_tf32_m16n8k8(
 SHFL_W8_CLAMP = 0x1800
 
 
+@dsl_user_op
+def opaque_zero_from_work_id(*, loc=None, ip=None):
+    """
+    Return 0 via opaque side-effectful asm (no inputs needed).
+
+    Because has_side_effects=True, MLIR LICM treats this as having memory
+    effects and will NOT hoist it outside the for_generate loop.  Any value
+    computed from the result (_oz) therefore appears loop-variant to LICM,
+    preventing get_slice() and scalar layout-invariant computations from being
+    hoisted to the kernel prologue.  This keeps prologue register pressure < 64
+    and eliminates the 440-byte stack frame that caused ~300-cycle L2 LDL
+    penalties per iteration.
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [],
+        "mov.b32 $0, 0;",   # output = 0 (opaque to compiler constant-folding)
+        "=r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip,
+    )
+    return cutlass.Int32(result)
+
+
 @cute.kernel
 def fused_kernel123(
     tma_atom_Q: cute.CopyAtom, tma_tensor_Q: cute.Tensor,
@@ -288,8 +316,10 @@ def fused_kernel123(
                 cute.arch.mbarrier_arrive(store_done_mbars + s)
 
     # =================================================================
-    # Persistent outer loop — for_generate with zero iter_args to avoid spilling.
-    # All warp-specialized sections inside the loop body.
+    # Persistent outer loop. Single for_generate at top level (required).
+    # Opaque asm barrier on work_id prevents MLIR LICM from hoisting
+    # get_slice() and scalar layout invariants to the kernel prologue,
+    # keeping register pressure < 64 and eliminating prologue spill.
     # =================================================================
     for work_id in for_generate(block_id, total_cgs, NUM_SMS):
         i_cg = work_id % cgs_per_head
@@ -297,17 +327,27 @@ def fused_kernel123(
         i_b = work_id // (cgs_per_head * num_heads)
         chunk_base = i_cg * CHUNKS_PER_BLOCK
 
+        # Anti-LICM barrier: _oz is always 0 but appears to depend on work_id.
+        # Because this asm has side_effects=True, it stays inside the loop.
+        # Any value computed from _oz/_lane/_warp is also loop-variant from
+        # LICM's perspective → get_slice() and scalar invariants stay in-loop.
+        _oz    = opaque_zero_from_work_id()
+        _lane  = lane_id + _oz
+        _warp  = warp_idx + _oz
+
         # =============================================================
         # Warps 0-15: Fused TMA + K1
         # =============================================================
         if warp_idx < NUM_K1_TMA_WARPS:
-            k1_warp = warp_idx
+            # Warp-layout invariants (scope-local → no cross-group register spill)
+            k1_warp        = _warp
             warp_row_group = k1_warp % K1_ROW_GROUPS
             warp_col_group = k1_warp // K1_ROW_GROUPS
-            k1_row_start = warp_row_group * ROWS_PER_K1_WARP
-            col_base = warp_col_group * K1_COLS_PER_WARP + lane_id * VEC
-            col_vec_idx = warp_col_group * (K1_COLS_PER_WARP // VEC) + lane_id
-            cumsum_scale = cutlass.Float32(RCP_LN2)
+            k1_row_start   = warp_row_group * ROWS_PER_K1_WARP
+            col_base       = warp_col_group * K1_COLS_PER_WARP + _lane * VEC
+            col_vec_idx    = warp_col_group * (K1_COLS_PER_WARP // VEC) + _lane
+            cumsum_scale   = cutlass.Float32(RCP_LN2)
+            thr_copy_k1    = tiled_copy_qk_k1.get_slice(_lane)
 
             rAcc = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
             rPrefix = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
@@ -317,7 +357,10 @@ def fused_kernel123(
             rKgOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
             rGkOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
 
-            # Prefetch chunk 0 for this work unit (warp 0)
+            # exp_A depends on i_h (changes per work unit)
+            exp_A = cute.exp(mA_log[i_h], fastmath=True)
+
+            # Prefetch chunk 0 for this work unit (warp 0 only)
             if warp_idx == 0:
                 pf_i_bnt = i_b * num_chunks + chunk_base
                 cute.arch.mbarrier_wait(stage_reuse_mbars, 0)
@@ -340,8 +383,6 @@ def fused_kernel123(
                 cute.copy(tma_atom_G, tg_pf, ts_pf, tma_bar_ptr=tma_mbars)
                 if lane_id == 0:
                     cute.arch.mbarrier_arrive(tma_mbars)
-
-            exp_A = cute.exp(mA_log[i_h], fastmath=True)
 
             for chunk_iter in cutlass.range_constexpr(CHUNKS_PER_BLOCK):
                 cur_stage = chunk_iter % NUM_STAGES
@@ -447,8 +488,6 @@ def fused_kernel123(
                 for vi in cutlass.range_constexpr(VEC):
                     rAcc[vi] = rPrefix[vi]
 
-                thr_copy_k1 = tiled_copy_qk_k1.get_slice(lane_id)
-
                 for ri in cutlass.range_constexpr(ROWS_PER_K1_WARP):
                     row = k1_row_start + ri
                     t = chunk_start + row
@@ -491,7 +530,10 @@ def fused_kernel123(
         # Warps 16-27: K2 MMA Compute
         # =============================================================
         if warp_idx >= NUM_K1_TMA_WARPS and warp_idx < NUM_K1_TMA_WARPS + NUM_MMA_WARPS:
-            mma_warp = warp_idx - NUM_K1_TMA_WARPS
+            # Warp-layout invariants (scope-local → no cross-group register spill)
+            _tid_in_group = _lane % 4
+            _group_id     = _lane // 4
+            mma_warp = _warp - NUM_K1_TMA_WARPS
             my_i_q = cutlass.Int32(0)
             my_i_k = cutlass.Int32(0)
             if mma_warp < 1:
@@ -506,24 +548,25 @@ def fused_kernel123(
             elif mma_warp < NUM_MMA_ACTIVE:
                 my_i_q = cutlass.Int32(3)
                 my_i_k = mma_warp - 6
-            q_row_base = my_i_q * BC
-            k_row_base = my_i_k * BC
+            q_row_base    = my_i_q * BC
+            k_row_base    = my_i_k * BC
             tile_col_base = mma_warp * BC
-            akk_row_base = k_row_base
-            akk_col_base = q_row_base
-            norm_row = q_row_base
+            akk_row_base  = k_row_base
+            akk_col_base  = q_row_base
+            norm_row      = q_row_base
             if my_i_q == my_i_k:
                 norm_row = q_row_base + cutlass.Int32(BC // 2)
-            group_id = lane_id // 4
-            tid_in_group = lane_id % 4
-            row0, row1 = group_id, group_id + 8
-            col0, col1 = tid_in_group * 2, tid_in_group * 2 + 1
-            col2, col3 = 8 + tid_in_group * 2, 8 + tid_in_group * 2 + 1
-            thr_mma = tiled_mma_k2.get_slice(lane_id)
-            thr_copy_A = tiled_copy_mma_A.get_slice(lane_id)
-            thr_copy_B = tiled_copy_mma_B.get_slice(lane_id)
-            thr_copy_Gn = tiled_copy_Gcum_norm.get_slice(tid_in_group)
-            thr_copy_Ggate = tiled_copy_Gcum_gate.get_slice(lane_id)
+            row0 = _group_id
+            row1 = _group_id + 8
+            col0 = _tid_in_group * 2
+            col1 = _tid_in_group * 2 + 1
+            col2 = 8 + _tid_in_group * 2
+            col3 = 8 + _tid_in_group * 2 + 1
+            thr_mma        = tiled_mma_k2.get_slice(_lane)
+            thr_copy_A     = tiled_copy_mma_A.get_slice(_lane)
+            thr_copy_B     = tiled_copy_mma_B.get_slice(_lane)
+            thr_copy_Gn    = tiled_copy_Gcum_norm.get_slice(_tid_in_group)
+            thr_copy_Ggate = tiled_copy_Gcum_gate.get_slice(_lane)
 
             for chunk_iter in cutlass.range_constexpr(CHUNKS_PER_BLOCK):
                 s = chunk_iter % NUM_STAGES
@@ -648,7 +691,6 @@ def fused_kernel123(
         # =============================================================
         if warp_idx >= NUM_K1_TMA_WARPS + NUM_MMA_WARPS:
             store_warp = warp_idx - (NUM_K1_TMA_WARPS + NUM_MMA_WARPS)
-
             for chunk_iter in cutlass.range_constexpr(CHUNKS_PER_BLOCK):
                 s = chunk_iter % NUM_STAGES
                 phase = chunk_iter // NUM_STAGES % 2
@@ -688,6 +730,7 @@ def fused_kernel123(
                 cute.arch.mbarrier_arrive(store_done_mbars + s)
 
         yield_out()
+
 
 
 # =========================================================================
